@@ -1,0 +1,13 @@
+[Unit]
+Description=工业巡检系统
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/bin/bash /项目根目录/scripts/start_system.sh
+ExecStop=/bin/bash /项目根目录/scripts/stop_system.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

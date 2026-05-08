@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# C build outputs
+*.o
+*.exe
+rk3588/inspection
+archive/rk3588_main/rk3588_main
+archive/rk3588_main/rk3588_main.exe
+
+# Runtime outputs
+.tmp/
+debug.log
+logs/
+demo_output/
+rk3588/alarm_log.csv
+vision/app/output/
+vision/output/
+vision/test/output/
+vision/records/
+
+# Models and large model weights
+models/*
+!models/README.md
+*.pt
+*.onnx
+*.rknn
+*.engine
+
+# Local settings and secrets
+.claude/
+.env
+.env.*
+
+# Local audio/image scratch files
+test.wav

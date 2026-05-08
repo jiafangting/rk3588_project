@@ -1,0 +1,8 @@
+{
+  "temp_max": 60.0,
+  "humidity_min": 20.0,
+  "humidity_max": 80.0,
+  "current_max": 10.0,
+  "temp_device_max": 80.0,
+  "smoke_alarm": 1
+}
