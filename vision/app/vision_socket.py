@@ -7,8 +7,10 @@ import signal
 import socket
 import threading
 
+from socket_config import get_vision_socket_path
 
-DEFAULT_SOCKET_PATH = "/tmp/vision_inspection.sock"
+
+DEFAULT_SOCKET_PATH = get_vision_socket_path()
 DEFAULT_TCP_HOST = "127.0.0.1"
 DEFAULT_TCP_PORT = 8765
 MAX_BUFFER_SIZE = 64 * 1024
@@ -23,7 +25,15 @@ def _socket_log(message):
 
 
 class VisionSocketServer:
-    """Background socket server used by the C main controller."""
+    """Background socket server used by the C main controller.
+
+    The server listens on ``DEFAULT_SOCKET_PATH`` unless a caller passes an
+    explicit path.  ``DEFAULT_SOCKET_PATH`` comes from ``socket_config`` and can
+    be overridden with ``VISION_SOCKET_PATH``.  Keeping that rule centralized is
+    important because C, UI, and voice processes are separate programs; if any
+    one of them uses a different path, the failure looks like "vision offline"
+    even though both processes may be running normally.
+    """
 
     def __init__(self, sock_path=DEFAULT_SOCKET_PATH, command_callback=None, tcp_host=DEFAULT_TCP_HOST, tcp_port=DEFAULT_TCP_PORT):
         self.sock_path = Path(sock_path)
@@ -218,11 +228,36 @@ class VisionSocketServer:
 
         cmd = payload.get("cmd")
         if cmd == "trigger_inspection":
-            self._notify_command(cmd, payload)
-            self._send_ack(conn, True, cmd, "Inspection trigger accepted")
+            result = self._notify_command(cmd, payload)
+            if isinstance(result, dict):
+                if "status" in result:
+                    self.update_status(result)
+                self._send_to_conn(conn, result)
+            else:
+                latest_status = self.get_latest_status()
+                latest_status.update(
+                    {
+                        "ack": True,
+                        "cmd": cmd,
+                        "message": "Inspection trigger accepted",
+                        "timestamp": _now_text(),
+                    }
+                )
+                self._send_to_conn(conn, latest_status)
             return
         if cmd == "get_status":
             self._send_to_conn(conn, self.get_latest_status())
+            return
+        if cmd == "reload_config":
+            # UI 保存阈值配置后会发送这个命令。
+            # Socket 层只负责确认收到了“请重新加载配置”的请求，真正的重载动作
+            # 交给上层 command_callback 实现；没有回调时也返回成功，避免 UI 因为
+            # 视觉主循环暂未接入热更新而误报 socket 通信失败。
+            result = self._notify_command(cmd, payload)
+            if isinstance(result, dict):
+                self._send_to_conn(conn, result)
+            else:
+                self._send_ack(conn, True, cmd, "Reload config accepted")
             return
         if cmd == "shutdown":
             self._notify_command(cmd, payload)
@@ -233,11 +268,19 @@ class VisionSocketServer:
 
     def _notify_command(self, cmd, payload):
         if self.command_callback is None:
-            return
+            return None
         try:
-            self.command_callback(cmd, payload)
+            return self.command_callback(cmd, payload)
         except Exception as exc:
             _socket_log(f"Command callback failed: {exc}")
+            return {
+                "ack": False,
+                "cmd": cmd,
+                "status": "UNKNOWN",
+                "person_count": 0,
+                "reason": f"Command callback failed: {exc}",
+                "timestamp": _now_text(),
+            }
 
     def _send_ack(self, conn, ok, cmd, message):
         self._send_to_conn(conn, {"ack": bool(ok), "cmd": cmd, "message": message, "timestamp": _now_text()})

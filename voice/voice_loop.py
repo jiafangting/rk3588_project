@@ -36,8 +36,12 @@ from llm_chat import LLMChat
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WAV_PATH = PROJECT_ROOT / "test.wav"
-DEFAULT_VISION_JSONL_PATH = PROJECT_ROOT / "vision" / "app" / "output" / "records.jsonl"
-DEFAULT_VISION_CSV_PATH = PROJECT_ROOT / "vision" / "app" / "output" / "records.csv"
+DEFAULT_VISION_OUTPUT_DIR = PROJECT_ROOT / "vision" / "app" / "output"
+DEFAULT_VISION_RECORDS_DIR = DEFAULT_VISION_OUTPUT_DIR / "recodes"
+DEFAULT_VISION_JSONL_PATH = DEFAULT_VISION_RECORDS_DIR / "records.jsonl"
+DEFAULT_VISION_CSV_PATH = DEFAULT_VISION_RECORDS_DIR / "records.csv"
+LEGACY_VISION_JSONL_PATH = DEFAULT_VISION_OUTPUT_DIR / "records.jsonl"
+LEGACY_VISION_CSV_PATH = DEFAULT_VISION_OUTPUT_DIR / "records.csv"
 
 
 WAKE_WORDS = ("小杜你好", "小度你好", "小杜", "小度", "wake", "xiaodu", "xiaodu你好")
@@ -248,6 +252,8 @@ class VoiceAssistant:
         self.vision_client = VisionSocketClient(vision_socket_path)
         self.vision_jsonl_path = DEFAULT_VISION_JSONL_PATH
         self.vision_csv_path = DEFAULT_VISION_CSV_PATH
+        self.legacy_vision_jsonl_path = LEGACY_VISION_JSONL_PATH
+        self.legacy_vision_csv_path = LEGACY_VISION_CSV_PATH
         self.llm = LLMChat()
         self.tts_server = TTSRequestServer(self.broadcaster)
         if self.llm.enabled:
@@ -538,9 +544,11 @@ class VoiceAssistant:
         - CSV 作为备用，便于 Excel 打开查看。
         """
         records = []
-        if self.vision_jsonl_path.exists():
+        for jsonl_path in (self.vision_jsonl_path, self.legacy_vision_jsonl_path):
+            if not jsonl_path.exists():
+                continue
             try:
-                with open(self.vision_jsonl_path, "r", encoding="utf-8") as f:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -549,22 +557,24 @@ class VoiceAssistant:
                         if self.is_alarm_record(obj):
                             records.append(obj)
             except Exception as exc:
-                print(f"[查询] 读取 JSONL 失败：{exc}")
+                print(f"[查询] 读取 JSONL 失败：{jsonl_path}，{exc}")
 
         if records:
             return records
 
-        if self.vision_csv_path.exists():
+        for csv_path in (self.vision_csv_path, self.legacy_vision_csv_path):
+            if not csv_path.exists():
+                continue
             try:
                 import csv
 
-                with open(self.vision_csv_path, "r", encoding="utf-8-sig") as f:
+                with open(csv_path, "r", encoding="utf-8-sig") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         if self.is_alarm_record(row):
                             records.append(row)
             except Exception as exc:
-                print(f"[查询] 读取 CSV 失败：{exc}")
+                print(f"[查询] 读取 CSV 失败：{csv_path}，{exc}")
 
         return records
 

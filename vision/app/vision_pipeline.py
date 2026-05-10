@@ -1,4 +1,5 @@
 from collections import deque
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import threading
@@ -19,6 +20,8 @@ from config import (
     HAZARD_ZONE,
     HAZARD_ZONE_MIN_OVERLAP_RATIO,
     JSONL_PATH,
+    LIVE_FRAME_INTERVAL_SECONDS,
+    LIVE_FRAME_PATH,
     MIN_PERSON_SCORE,
     MODEL_PATH,
     NO_PERSON_FRAMES_REQUIRED,
@@ -139,7 +142,21 @@ def count_intrusions(person_boxes, hazard_zone):
     return hit_count, hit_count > 0
 
 
-def build_socket_status(decision, current_person_count):
+def save_live_frame(image, output_path=LIVE_FRAME_PATH):
+    """Publish the latest processed frame for UI preview."""
+    if image is None:
+        return ""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(".tmp.jpg")
+    if not cv2.imwrite(str(temp_path), image):
+        return ""
+    temp_path.replace(output_path)
+    return str(output_path)
+
+
+def build_socket_status(decision, current_person_count, live_frame_path=""):
     """Build the small status payload shared with the voice module.
 
     The voice module should not have to parse images or local cache. It only
@@ -153,6 +170,41 @@ def build_socket_status(decision, current_person_count):
         "zone_name": decision.zone_name or "",
         "intruded_people": decision.intruded_people,
         "alarm_frame_count": decision.alarm_frame_count,
+        "zone_hit": bool(decision.zone_hit),
+        "alarm_type": decision.alarm_name or "",
+        "live_frame_path": live_frame_path,
+        "result_path": live_frame_path,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def build_manual_snapshot_response(decision, current_person_count, raw_path, result_path, speech_text, record, live_frame_path=""):
+    """Build the socket response after a voice-triggered manual snapshot."""
+    response = build_socket_status(decision, current_person_count, live_frame_path)
+    response.update(
+        {
+            "ack": True,
+            "cmd": "trigger_inspection",
+            "message": "Inspection snapshot saved",
+            "raw_path": str(raw_path),
+            "result_path": str(result_path),
+            "snapshot_path": str(result_path),
+            "speech_text": speech_text,
+            "record_status": record.get("status", ""),
+            "record_timestamp": record.get("timestamp", ""),
+        }
+    )
+    return response
+
+
+def build_socket_error_response(cmd, message):
+    """Return a status-shaped error so voice clients do not wait for timeout."""
+    return {
+        "ack": False,
+        "cmd": cmd,
+        "status": "UNKNOWN",
+        "person_count": 0,
+        "reason": message,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -408,16 +460,74 @@ def main():
     alarm_latched = False
     alarm_clear_count = 0
     last_display_status = None
+    last_live_frame_write = 0.0
+    live_frame_path = ""
 
     bridge = VisionBridge(output_dir=output_dir)
     bridge.no_person_counter = 0
+    frame_context_lock = threading.Lock()
+    frame_context = {
+        "ready": False,
+        "preview": None,
+        "result_image": None,
+        "decision": None,
+        "stable_status": None,
+        "current_person_count": 0,
+        "live_frame_path": "",
+    }
+
+    def handle_socket_command(cmd, payload):
+        """Handle commands that need the current visual frame."""
+        if cmd == "trigger_inspection":
+            with frame_context_lock:
+                if not frame_context["ready"]:
+                    return build_socket_error_response(cmd, "视觉画面还没有准备好，暂时无法保存当前巡检记录。")
+
+                preview_snapshot = frame_context["preview"].copy()
+                result_snapshot = frame_context["result_image"].copy()
+                decision_snapshot = deepcopy(frame_context["decision"])
+                stable_status_snapshot = frame_context["stable_status"]
+                current_person_count_snapshot = frame_context["current_person_count"]
+                live_frame_path_snapshot = frame_context["live_frame_path"]
+
+            raw_path, result_path, snapshot_speech_text, record = bridge.manual_snapshot(
+                preview=preview_snapshot,
+                result_image=result_snapshot,
+                stable_status=stable_status_snapshot,
+                decision=decision_snapshot,
+                jsonl_path=jsonl_path,
+                csv_path=csv_path,
+            )
+            print("Voice-triggered inspection snapshot saved:")
+            print(f"- Raw image: {raw_path}")
+            print(f"- Result image: {result_path}")
+
+            return build_manual_snapshot_response(
+                decision=decision_snapshot,
+                current_person_count=current_person_count_snapshot,
+                raw_path=raw_path,
+                result_path=result_path,
+                speech_text=snapshot_speech_text,
+                record=record,
+                live_frame_path=live_frame_path_snapshot,
+            )
+
+        if cmd == "reload_config":
+            return {
+                "ack": True,
+                "cmd": cmd,
+                "message": "Reload config accepted. Restart vision pipeline if threshold values changed.",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        return None
 
     # Start the socket server used by voice/vision_control.py.
     # Without this server the voice module can only read old JSONL/CSV files,
     # so a live visual alarm may be missed until a record is written. Publishing
     # the latest status on every frame keeps "有没有报警" synchronized with the
     # current visual state.
-    socket_server = VisionSocketServer()
+    socket_server = VisionSocketServer(command_callback=handle_socket_command)
     socket_server.start()
 
     window_name = "YOLO11 Voice Broadcast"
@@ -464,7 +574,25 @@ def main():
             else:
                 bridge.no_person_counter = 0
 
-            socket_status = build_socket_status(decision, current_person_count)
+            now_for_live_frame = time.time()
+            if now_for_live_frame - last_live_frame_write >= LIVE_FRAME_INTERVAL_SECONDS:
+                live_frame_path = save_live_frame(result_image)
+                last_live_frame_write = now_for_live_frame
+
+            with frame_context_lock:
+                frame_context.update(
+                    {
+                        "ready": True,
+                        "preview": preview,
+                        "result_image": result_image,
+                        "decision": decision,
+                        "stable_status": stable_status,
+                        "current_person_count": current_person_count,
+                        "live_frame_path": live_frame_path,
+                    }
+                )
+
+            socket_status = build_socket_status(decision, current_person_count, live_frame_path)
             socket_server.update_status(socket_status)
             socket_server.send_result(socket_status)
 

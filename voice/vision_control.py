@@ -9,12 +9,26 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import socket
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+VISION_APP_DIR = PROJECT_ROOT / "vision" / "app"
+if str(VISION_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_APP_DIR))
+
+from socket_config import get_vision_socket_path
 
 
-DEFAULT_VISION_SOCKET_PATH = "/tmp/vision_inspection.sock"
+DEFAULT_VISION_SOCKET_PATH = get_vision_socket_path()
 DEFAULT_VISION_TCP_HOST = "127.0.0.1"
 DEFAULT_VISION_TCP_PORT = 8765
+
+# 语音模块和视觉模块通常是两个独立进程。
+# Unix Socket 路径必须和视觉服务端完全一致，否则语音侧会误判为
+# “视觉模块未启动”。这里不再写死 /tmp 路径，而是复用 socket_config：
+# 默认 /tmp/vision_inspection.sock，部署时用 VISION_SOCKET_PATH 覆盖。
 
 
 class VisionSocketClient:

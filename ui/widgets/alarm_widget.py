@@ -9,7 +9,7 @@
 4. 5 秒后停止闪烁但保留历史记录。
 
 硬件依赖：
-- alarm_log.csv
+- vision/app/output/recodes/records.csv
 
 作者：Cursor
 """
@@ -26,7 +26,11 @@ from PyQt5.QtWidgets import QPushButton, QVBoxLayout, QWidget, QLabel
 from data.ui_state import UIState
 
 
-ALARM_LOG_PATH = Path(__file__).resolve().parents[2] / "rk3588" / "alarm_log.csv"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+VISION_OUTPUT_DIR = PROJECT_ROOT / "vision" / "app" / "output"
+VISION_RECORDS_CSV_PATH = VISION_OUTPUT_DIR / "recodes" / "records.csv"
+VISION_RECORDS_JSONL_PATH = VISION_OUTPUT_DIR / "recodes" / "records.jsonl"
+LEGACY_VISION_RECORDS_CSV_PATH = VISION_OUTPUT_DIR / "records.csv"
 
 
 class AlarmWidget(QWidget):
@@ -78,16 +82,20 @@ class AlarmWidget(QWidget):
         self._updateBorder(records)
 
     def _loadRecords(self):
-        """从 CSV 加载记录。"""
-        if not ALARM_LOG_PATH.exists():
-            return []
-        with open(ALARM_LOG_PATH, "r", encoding="utf-8-sig") as f:
-            return list(csv.DictReader(f))
+        """从视觉记录 CSV 加载记录。"""
+        for csv_path in (VISION_RECORDS_CSV_PATH, LEGACY_VISION_RECORDS_CSV_PATH):
+            if not csv_path.exists():
+                continue
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                return list(csv.DictReader(f))
+        return []
 
     def clearRecords(self):
-        """清空报警 CSV 文件。"""
-        with open(ALARM_LOG_PATH, "w", encoding="utf-8-sig") as f:
-            f.write("timestamp,level,reason\n")
+        """清空视觉记录 CSV 文件。"""
+        VISION_RECORDS_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(VISION_RECORDS_CSV_PATH, "w", encoding="utf-8-sig") as f:
+            f.write("timestamp,status,reason,speech_text,raw_path,result_path,person_count,summary\n")
+        VISION_RECORDS_JSONL_PATH.write_text("", encoding="utf-8")
         self.refresh()
 
     def _updateBorder(self, records):
@@ -95,8 +103,13 @@ class AlarmWidget(QWidget):
         alarmActive = False
         if records:
             last = records[-1]
-            reason = str(last.get("reason", last.get("alarm_reason", "")))
-            alarmActive = bool(reason) and str(last.get("level", last.get("status", ""))) != "0"
+            status = str(last.get("status", "")).upper()
+            alarmActive = (
+                status == "ALARM"
+                or bool(str(last.get("alarm_type", "")).strip())
+                or bool(str(last.get("alarm_time", "")).strip())
+                or bool(str(last.get("alarm_reason", "")).strip())
+            )
 
         if alarmActive:
             if self.flashStartTime == 0:

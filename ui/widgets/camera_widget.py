@@ -1,18 +1,8 @@
-"""camera_widget.py
+"""Camera preview widget for the UI.
 
-摄像头画面组件。
-
-作用：
-1. 显示摄像头画面；
-2. 支持直连模式和共享模式；
-3. 叠加检测框、状态文字和时间戳；
-4. 报警时边框闪烁提示。
-
-硬件依赖：
-- OpenCV 摄像头输入
-- 视觉模块输出帧或共享状态
-
-作者：Cursor
+The widget prefers a live local camera feed. If the camera is already owned by
+the vision process, it falls back to the shared live frame path published by the
+vision socket status.
 """
 
 from __future__ import annotations
@@ -28,59 +18,67 @@ from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 from data.ui_state import UIState
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+VISION_PHOTOS_DIR = PROJECT_ROOT / "vision" / "app" / "output" / "photos"
+VISION_LIVE_FRAME_PATH = VISION_PHOTOS_DIR / "live_frame.jpg"
+
+
 class CameraWidget(QWidget):
-    """摄像头画面显示控件。"""
+    """Live camera/vision-frame display widget."""
 
     def __init__(self, ui_state: UIState, parent=None):
         super().__init__(parent)
         self.uiState = ui_state
-        self.label = QLabel("摄像头未连接")
+        self.label = QLabel("Camera not connected")
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setMinimumSize(640, 400)
         self.label.setStyleSheet("color: white; font-size: 18px; background-color: #111827;")
 
+        self.cap = None
+        self.useSharedMode = True
+        self.directCameraFailed = False
+        self.directFallbackAfter = time.time() + 1.5
+        self.blinkState = False
+        self.lastBlinkTime = time.time()
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.updateFrame)
         self.timer.start(100)
-
-        self.cap = None
-        self.useSharedMode = True
-        self.blinkState = False
-        self.lastBlinkTime = time.time()
 
         layout = QVBoxLayout()
         layout.addWidget(self.label)
         self.setLayout(layout)
 
     def startDirectCamera(self):
-        """切换到直连摄像头模式。"""
+        """Switch to direct camera mode."""
         if self.cap is None:
-            self.cap = cv2.VideoCapture(0)
+            self.cap = self._openCamera()
         self.useSharedMode = False
+        self.directCameraFailed = False
+        self.directFallbackAfter = 0.0
 
     def useSharedFrameMode(self):
-        """切换到共享帧模式。"""
+        """Switch to shared frame mode."""
         self.useSharedMode = True
         if self.cap is not None:
             self.cap.release()
             self.cap = None
 
     def updateFrame(self):
-        """刷新画面。"""
+        """Refresh the preview image."""
         frame = None
 
         if self.useSharedMode:
             frame = self._readSharedFrame()
-        else:
-            if self.cap is None:
-                self.cap = cv2.VideoCapture(0)
-            if self.cap is not None and self.cap.isOpened():
-                ok, raw = self.cap.read()
-                if ok:
-                    frame = raw
+
+        if frame is None and not self.directCameraFailed and time.time() >= self.directFallbackAfter:
+            frame = self._readDirectCameraFrame()
 
         if frame is None:
-            self.label.setText("摄像头未连接")
+            frame = self._readSharedFrame()
+
+        if frame is None:
+            self.label.setText("Camera not connected")
             return
 
         frame = cv2.resize(frame, (640, 400))
@@ -92,16 +90,56 @@ class CameraWidget(QWidget):
         image = QImage(rgb.data, w, h, bytesPerLine, QImage.Format_RGB888)
         self.label.setPixmap(QPixmap.fromImage(image))
 
-    def _readSharedFrame(self):
-        """从共享状态读取已处理画面。"""
-        previewPath = self.uiState.latest_frame_path
-        if previewPath and Path(previewPath).exists():
-            img = cv2.imread(previewPath)
-            return img
+    def _openCamera(self):
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            return cap
+        cap.release()
         return None
 
+    def _readDirectCameraFrame(self):
+        if self.cap is None:
+            self.cap = self._openCamera()
+        if self.cap is None or not self.cap.isOpened():
+            self.directCameraFailed = True
+            return None
+
+        ok, raw = self.cap.read()
+        if ok and raw is not None:
+            return raw
+
+        self.directCameraFailed = True
+        self.cap.release()
+        self.cap = None
+        return None
+
+    def _readSharedFrame(self):
+        for previewPath in (self.uiState.live_frame_path, self.uiState.latest_frame_path, str(VISION_LIVE_FRAME_PATH)):
+            if previewPath and Path(previewPath).exists():
+                img = cv2.imread(previewPath)
+                if img is not None:
+                    return img
+        latestPhoto = self._findLatestPhoto()
+        if latestPhoto:
+            return cv2.imread(str(latestPhoto))
+        return None
+
+    def _findLatestPhoto(self):
+        if not VISION_PHOTOS_DIR.exists():
+            return None
+        candidates = list(VISION_PHOTOS_DIR.glob("voice_result_*.jpg"))
+        if not candidates:
+            candidates = list(VISION_PHOTOS_DIR.glob("*.jpg"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
     def _drawOverlay(self, frame):
-        """叠加状态、时间戳和报警闪烁边框。"""
         status = self.uiState.vision_status
         color = (15, 155, 88)
         if status == "ALARM":
@@ -123,7 +161,6 @@ class CameraWidget(QWidget):
         return frame
 
     def closeEvent(self, event):
-        """关闭窗口时释放摄像头。"""
         if self.cap is not None:
             self.cap.release()
         super().closeEvent(event)

@@ -9,9 +9,13 @@ PROJECT_ROOT = VISION_DIR.parent
 
 MODEL_PATH = PROJECT_ROOT / "models" / "yolo11n" / "yolo11n.pt"
 OUTPUT_DIR = APP_DIR / "output"
+PHOTOS_DIR = OUTPUT_DIR / "photos"
+RECORDS_DIR = OUTPUT_DIR / "recodes"
 ALARM_CLIP_DIR = OUTPUT_DIR / "clips"
-JSONL_PATH = OUTPUT_DIR / "records.jsonl"
-CSV_PATH = OUTPUT_DIR / "records.csv"
+JSONL_PATH = RECORDS_DIR / "records.jsonl"
+CSV_PATH = RECORDS_DIR / "records.csv"
+LIVE_FRAME_PATH = PHOTOS_DIR / "live_frame.jpg"
+LIVE_FRAME_INTERVAL_SECONDS = 0.10
 
 CAMERA_INDEX = 0
 STABLE_FRAMES_REQUIRED = 5
@@ -50,6 +54,8 @@ HAZARD_ZONE = {
 
 def ensure_output_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     ALARM_CLIP_DIR.mkdir(parents=True, exist_ok=True)
     return OUTPUT_DIR
 

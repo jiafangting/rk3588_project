@@ -126,6 +126,10 @@ class MockVisionSocketServer:
             self._send(conn, self.latest_result)
             return
 
+        if cmd == "reload_config":
+            self._send(conn, {"ack": True, "cmd": cmd, "message": "mock reload accepted"})
+            return
+
         if cmd == "shutdown":
             self._send(conn, {"ack": True, "cmd": cmd, "message": "mock shutdown accepted"})
             self.running = False

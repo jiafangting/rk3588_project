@@ -121,10 +121,18 @@ def _save_image(image, path):
     return cv2.imwrite(path, image)
 
 
+def _resolve_photos_dir(output_dir):
+    output_dir = Path(output_dir)
+    if output_dir.name == "photos":
+        return output_dir
+    return output_dir / "photos"
+
+
 def save_snapshot_record(preview, result_image, stable_status, decision, output_dir, jsonl_path, csv_path):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_path = output_dir / f"voice_raw_{timestamp}.jpg"
-    result_path = output_dir / f"voice_result_{timestamp}.jpg"
+    photos_dir = _resolve_photos_dir(output_dir)
+    raw_path = photos_dir / f"voice_raw_{timestamp}.jpg"
+    result_path = photos_dir / f"voice_result_{timestamp}.jpg"
 
     if not _save_image(preview, str(raw_path)) or not _save_image(result_image, str(result_path)):
         raise RuntimeError("Snapshot save failed")

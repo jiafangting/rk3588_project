@@ -33,5 +33,5 @@ make
 ## 说明
 
 - 串口未接入时，传感器线程会自动切换模拟模式。
-- 视觉模块默认通过 Unix Socket `/tmp/vision.sock` 查询状态。
+- 视觉模块默认通过 Unix Socket `/tmp/vision_inspection.sock` 查询状态；如需部署到其他路径，统一设置 `VISION_SOCKET_PATH` 环境变量。
 - 目前报警动作部分已预留 STM32 串口指令接口，后续可以直接接硬件。

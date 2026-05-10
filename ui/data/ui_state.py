@@ -29,6 +29,7 @@ import csv
 import json
 import random
 import socket
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,21 @@ from typing import Dict, List
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-VISION_SOCKET_PATH = "/tmp/vision.sock"
+VISION_APP_DIR = PROJECT_ROOT / "vision" / "app"
+if str(VISION_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_APP_DIR))
+
+from socket_config import get_vision_socket_path
+
+
+VISION_SOCKET_PATH = get_vision_socket_path()
+VISION_OUTPUT_DIR = PROJECT_ROOT / "vision" / "app" / "output"
+VISION_PHOTOS_DIR = VISION_OUTPUT_DIR / "photos"
+VISION_RECORDS_DIR = VISION_OUTPUT_DIR / "recodes"
+VISION_RECORDS_CSV_PATH = VISION_RECORDS_DIR / "records.csv"
+VISION_RECORDS_JSONL_PATH = VISION_RECORDS_DIR / "records.jsonl"
+VISION_LIVE_FRAME_PATH = VISION_PHOTOS_DIR / "live_frame.jpg"
+LEGACY_VISION_RECORDS_CSV_PATH = VISION_OUTPUT_DIR / "records.csv"
 ALARM_LOG_PATH = PROJECT_ROOT / "rk3588" / "alarm_log.csv"
 CONFIG_PATH = PROJECT_ROOT / "rk3588" / "config.json"
 
@@ -69,6 +84,7 @@ class UIState:
     alarm_records: List[dict] = field(default_factory=list)
     threshold: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_THRESHOLD))
     latest_frame_path: str = ""
+    live_frame_path: str = ""
     last_refresh_time: str = ""
 
     def refresh(self):
@@ -89,12 +105,15 @@ class UIState:
             self.vision_status = str(vision_data.get("status", "UNKNOWN"))
             self.person_count = int(vision_data.get("person_count", 0))
             self.alarm_active = self.vision_status == "ALARM"
-            self.latest_frame_path = str(vision_data.get("result_path", ""))
+            self.live_frame_path = str(vision_data.get("live_frame_path", ""))
+            self.latest_frame_path = str(vision_data.get("result_path", "")) or self._find_latest_photo_path()
             vision_ok = True
         except Exception:
             self.vision_status = "UNKNOWN"
             self.person_count = 0
             self.alarm_active = False
+            self.live_frame_path = str(VISION_LIVE_FRAME_PATH) if VISION_LIVE_FRAME_PATH.exists() else ""
+            self.latest_frame_path = self._find_latest_photo_path()
 
         try:
             self.alarm_records = self._read_alarm_records()
@@ -122,7 +141,10 @@ class UIState:
 
     def _query_vision_status(self):
         """通过 Unix Socket 查询视觉状态。"""
-        payload = b'{"cmd":"query_status"}\n'
+        # 视觉 socket 协议和语音/C 主控保持一致：所有请求都是一行 JSON，
+        # 以换行符结尾。get_status 只读取服务端缓存的最新结果，不触发新的
+        # 相机推理，因此 UI 可以高频刷新而不会拖慢视觉主流程。
+        payload = b'{"cmd":"get_status"}\n'
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(2.0)
             sock.connect(VISION_SOCKET_PATH)
@@ -139,18 +161,34 @@ class UIState:
         raise RuntimeError("视觉模块没有返回数据")
 
     def _read_alarm_records(self):
-        """读取报警日志的最近记录。"""
+        """读取视觉巡检记录的最近记录。"""
         records = []
-        if not ALARM_LOG_PATH.exists():
-            return records
-
-        with open(ALARM_LOG_PATH, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if not row:
-                    continue
-                records.append(row)
+        for csv_path in (VISION_RECORDS_CSV_PATH, LEGACY_VISION_RECORDS_CSV_PATH, ALARM_LOG_PATH):
+            if not csv_path.exists():
+                continue
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    records.append(row)
+            if records:
+                break
         return records[-5:]
+
+    def _find_latest_photo_path(self):
+        """查找视觉 photos 目录里最新的一张结果图。"""
+        if VISION_LIVE_FRAME_PATH.exists():
+            return str(VISION_LIVE_FRAME_PATH)
+        if not VISION_PHOTOS_DIR.exists():
+            return ""
+
+        candidates = list(VISION_PHOTOS_DIR.glob("voice_result_*.jpg"))
+        if not candidates:
+            candidates = list(VISION_PHOTOS_DIR.glob("*.jpg"))
+        if not candidates:
+            return ""
+        return str(max(candidates, key=lambda path: path.stat().st_mtime))
 
     def _read_latest_sensor_values_from_csv(self):
         """从 CSV 中读取最新一行传感器值。"""

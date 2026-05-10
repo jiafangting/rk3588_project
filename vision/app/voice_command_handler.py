@@ -34,8 +34,9 @@ from vision_bridge import VisionBridge
 #   备用日志文件，用于 Excel 查看。
 # =========================
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_VISION_JSONL_PATH = PROJECT_ROOT / "vision" / "app" / "output" / "records.jsonl"
-DEFAULT_VISION_CSV_PATH = PROJECT_ROOT / "vision" / "app" / "output" / "records.csv"
+DEFAULT_VISION_RECORDS_DIR = PROJECT_ROOT / "vision" / "app" / "output" / "recodes"
+DEFAULT_VISION_JSONL_PATH = DEFAULT_VISION_RECORDS_DIR / "records.jsonl"
+DEFAULT_VISION_CSV_PATH = DEFAULT_VISION_RECORDS_DIR / "records.csv"
 
 _bridge = VisionBridge()
 _bridge.vision_jsonl_path = DEFAULT_VISION_JSONL_PATH

@@ -6,12 +6,16 @@
 #   1. C 主进程是否存活
 #   2. 视觉模块是否存活
 #   3. 语音模块是否存活
-#   4. /tmp/vision.sock 是否可用
+#   4. 统一视觉 socket 是否可用
 
 set -u
 
 PID_FILE="/tmp/inspection_pids.txt"
-VISION_SOCK="/tmp/vision.sock"
+# 视觉 socket 路径统一规则：
+# - 默认值和 Python 视觉服务端、语音模块、UI、C 主控一致；
+# - 部署时需要换路径，只设置 VISION_SOCKET_PATH 环境变量即可；
+# - 不要在脚本里另写一个 /tmp/xxx.sock，避免健康检查和真实服务检查不同文件。
+VISION_SOCK="${VISION_SOCKET_PATH:-/tmp/vision_inspection.sock}"
 RET=0
 
 get_pid() {

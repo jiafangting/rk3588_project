@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -35,8 +36,16 @@ from PyQt5.QtWidgets import (
 from data.ui_state import DEFAULT_THRESHOLD, UIState
 
 
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "rk3588" / "config.json"
-VISION_SOCKET_PATH = "/tmp/vision.sock"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+VISION_APP_DIR = PROJECT_ROOT / "vision" / "app"
+if str(VISION_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(VISION_APP_DIR))
+
+from socket_config import get_vision_socket_path
+
+
+CONFIG_PATH = PROJECT_ROOT / "rk3588" / "config.json"
+VISION_SOCKET_PATH = get_vision_socket_path()
 
 
 class ThresholdWidget(QWidget):
@@ -135,6 +144,9 @@ class ThresholdWidget(QWidget):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1.0)
                 sock.connect(VISION_SOCKET_PATH)
+                # 配置保存后只发一条 reload_config 指令。
+                # 这里使用统一的 VISION_SOCKET_PATH，避免 UI 写完 config.json 后
+                # 通知了旧 socket，导致视觉服务端没有收到热更新请求。
                 sock.sendall(b'{"cmd":"reload_config"}\n')
         except Exception:
             pass

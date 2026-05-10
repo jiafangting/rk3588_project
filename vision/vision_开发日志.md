@@ -155,6 +155,12 @@
 - 原因：之前的代码主要集中在主流程里，模块间联动还不够清晰
 - 处理：新增 `vision_bridge.py`，统一管理报警落盘、记录缓存、查询支持、串口联动、最近报警截图
 
+### 问题 19：语音触发巡检保存只收到 ACK，没有真正返回保存结果
+- 现象：语音侧说“帮我保存一下”时，会向视觉 socket 发送 `trigger_inspection`，但视觉 socket 只返回 ACK。语音客户端等待包含 `status` 的视觉结果，容易卡到超时；同时视觉主流程没有真正调用当前帧保存逻辑，导致“已保存当前巡检记录”可能只是口头确认。
+- 原因：`VisionSocketServer` 的 `trigger_inspection` 没有把命令交给 `vision_pipeline.py` 的当前帧上下文处理；`vision_pipeline.py` 启动 socket 服务时也没有传 `command_callback`。socket 层和主流程之间缺少“命令 -> 当前帧截图 -> 写入 JSONL/CSV -> 返回路径”的闭环。
+- 处理：让 socket 命令回调可以返回完整 JSON；在 `vision_pipeline.py` 中保存最近一帧的 `preview / result_image / decision / live_frame_path` 上下文；收到 `trigger_inspection` 后调用 `bridge.manual_snapshot()` 真正落盘，并返回 `status / person_count / reason / raw_path / result_path / snapshot_path`。如果画面尚未准备好，则返回 `status=UNKNOWN` 的错误结果，避免语音侧一直等待超时。
+- 当前结果：语音触发“帮我保存一下”后，视觉侧会保存当前巡检截图和记录，并把保存路径返回给语音模块播报。
+
 ---
 
 ## 5. 当前成果总结
