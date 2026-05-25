@@ -1,12 +1,22 @@
-"""voice_command_handler.py
-
-语音指令处理模块。
+"""语音指令处理模块。
 
 这个文件的作用是：
 1. 接收 ASR 识别出来的文字；
 2. 识别用户想问什么；
 3. 去读取视觉报警记录；
 4. 返回一句适合 TTS 播报的话。
+
+它相当于“语音输入和系统功能之间的翻译层”：
+- 用户说中文；
+- ASR 变成文本；
+- 这里把文本转成系统动作或播报回复。
+
+流程：
+1. `handle_command()` 接收文本；
+2. `_normalize()` 统一去空格、标点；
+3. 按关键词判断意图；
+4. 读取报警日志或返回确认语句；
+5. 把最终回复交给 TTS。
 
 设计原则：
 - 不改语音模块原有结构，只提供一个可调用的处理函数；
@@ -37,6 +47,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_VISION_RECORDS_DIR = PROJECT_ROOT / "vision" / "app" / "output" / "recodes"
 DEFAULT_VISION_JSONL_PATH = DEFAULT_VISION_RECORDS_DIR / "records.jsonl"
 DEFAULT_VISION_CSV_PATH = DEFAULT_VISION_RECORDS_DIR / "records.csv"
+
+# 这两个默认路径的意义：
+# - JSONL 适合程序读取，字段完整；
+# - CSV 适合 Excel / 人工查看。
+# 如果日志格式变化，优先保持 JSONL 结构稳定。
 
 _bridge = VisionBridge()
 _bridge.vision_jsonl_path = DEFAULT_VISION_JSONL_PATH
@@ -105,10 +120,18 @@ def handle_command(asr_text: str) -> str:
     """统一的语音指令处理入口。
 
     参数：
-    - asr_text: ASR 识别出来的原始文本
+    - `asr_text`：ASR 识别出来的原始文本
 
-    返回：
+    返回值：
     - 适合 TTS 播报的回复字符串
+
+    流程：
+    1. 先归一化文本；
+    2. 判断是不是报警查询；
+    3. 判断是不是保存请求；
+    4. 判断是不是视觉状态查询；
+    5. 判断是不是巡检请求；
+    6. 如果都不是，返回默认理解失败提示。
 
     说明：
     - 这个函数只负责“理解文字并返回回复”；

@@ -1,4 +1,19 @@
-"""唤醒词 + 模式切换 + 中文识别 + 语音播报闭环。
+"""语音模块主入口。
+
+这个文件把“麦克风录音 -> 语音识别 -> 指令判断 -> TTS 播报 -> 视觉联动”
+串成一整条闭环。
+
+整体流程：
+1. 等待用户说话；
+2. 用音量阈值自动结束录音；
+3. 保存成 WAV；
+4. 用 faster-whisper 识别中文；
+5. 根据唤醒词切换待机/工作模式；
+6. 在工作模式下处理温度、模式、视觉查询、报警查询、保存画面等指令；
+7. 必要时调用 LLM 做意图纠错或闲聊回复；
+8. 把最终回复交给语音播报模块；
+9. 长时间没输入则自动回到待机；
+10. 遇到停止词时退出程序。
 
 运行方式：
     D:\\anaconda3\\envs\\rk3588-ai\\python.exe voice\\voice_loop.py
@@ -19,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +58,22 @@ DEFAULT_VISION_JSONL_PATH = DEFAULT_VISION_RECORDS_DIR / "records.jsonl"
 DEFAULT_VISION_CSV_PATH = DEFAULT_VISION_RECORDS_DIR / "records.csv"
 LEGACY_VISION_JSONL_PATH = DEFAULT_VISION_OUTPUT_DIR / "records.jsonl"
 LEGACY_VISION_CSV_PATH = DEFAULT_VISION_OUTPUT_DIR / "records.csv"
+DEFAULT_THRESHOLD_CONFIG_PATH = PROJECT_ROOT / "rk3588" / "config.json"
+RK_ALARM_LOG_PATH = PROJECT_ROOT / "rk3588" / "alarm_log.csv"
+VOICE_EXCHANGE_PATH = PROJECT_ROOT / ".tmp" / "voice_last_exchange.json"
+
+# 这份默认阈值要和 UI / 仿真后端保持一致。
+# 如果 rk3588/config.json 存在，语音模块会优先读取配置文件里的阈值。
+DEFAULT_THRESHOLD = {
+    "temp_max": 60.0,
+    "humidity_min": 20.0,
+    "humidity_max": 80.0,
+    "voltage_min": 210.0,
+    "voltage_max": 240.0,
+    "current_max": 10.0,
+    "temp_device_max": 80.0,
+    "smoke_alarm": 1,
+}
 
 
 WAKE_WORDS = ("小杜你好", "小度你好", "小杜", "小度", "wake", "xiaodu", "xiaodu你好")
@@ -64,7 +96,11 @@ WORK_MODE_TIMEOUT_SECONDS = 20
 
 @dataclass
 class VoiceConfig:
-    """语音模块运行参数。"""
+    """语音模块运行参数。
+
+    这是语音模块的“参数总表”。
+    你后面要调麦克风灵敏度、录音时长、识别模型大小，基本都从这里入手。
+    """
 
     sample_rate: int = 16000
     channels: int = 1
@@ -88,6 +124,21 @@ class WhisperRecognizer:
         self._model = None
 
     def transcribe(self, wav_path):
+        """把 WAV 文件识别成中文文本。
+
+        参数：
+        - `wav_path`：待识别的音频文件路径
+
+        返回值：
+        - `text`：识别出来的文本
+        - `language`：识别语言
+        - `probability`：语言置信度
+
+        原理：
+        - 模型第一次调用时才加载，避免启动卡顿；
+        - `beam_size=5` 让识别结果更稳一些；
+        - `vad_filter=True` 让模型尽量忽略静音段。
+        """
         if self._model is None:
             print(f"[识别] 正在加载 faster-whisper 模型：{self.model_name}")
             from faster_whisper import WhisperModel
@@ -127,15 +178,22 @@ DIRECT_TEXT_COMMAND_WORDS = (
     "当前是什么模式",
     "当前温度多少",
     "温度",
+    "湿度",
     "电流",
     "电压",
     "烟雾",
+    "烟感",
+    "设备温度",
+    "传感器状态",
+    "设备状态",
+    "系统状态",
     "开始巡检",
     "巡检",
     "检测",
     "查询视觉状态",
     "视觉状态",
     "有没有报警",
+    "有无报警",
     "有沒有報警",
     "最近一次报警",
     "最近一次報警",
@@ -148,6 +206,7 @@ DIRECT_TEXT_COMMAND_WORDS = (
     "幫我保存一下",
     "mode",
     "temp",
+    "humidity",
     "current",
     "voltage",
     "smoke",
@@ -181,9 +240,22 @@ NORMALIZATION_REPLACEMENTS = {
 def record_until_silence(config: VoiceConfig):
     """监听麦克风，检测静音后自动结束本轮录音。
 
-    返回：
-        True  表示录到了有效声音；
-        False 表示本轮基本是静音。
+    参数：
+    - `config`：语音配置对象，里面定义采样率、阈值、录音时长等
+
+    返回值：
+    - `True`：录到了有效语音并写入 WAV
+    - `False`：本轮基本是静音或录音无效
+
+    流程：
+    1. 先等待 TTS 播报结束，避免把自己的声音录进去；
+    2. 打开麦克风输入流；
+    3. 按 100ms 一帧读取音频；
+    4. 计算每帧音量；
+    5. 音量超过阈值就认为开始说话；
+    6. 连续静音一段时间后结束录音；
+    7. 保存成 `test.wav`；
+    8. 返回是否成功。
     """
     frame_samples = int(config.sample_rate * config.frame_ms / 1000)
     max_frames = int(config.max_record_seconds * 1000 / config.frame_ms)
@@ -239,9 +311,32 @@ def record_until_silence(config: VoiceConfig):
 
 
 class VoiceAssistant:
-    """带模式状态的语音助手。"""
+    """带模式状态的语音助手。
+
+    这个类是整个语音模块的调度中心：
+    - 管理待机/工作模式；
+    - 管理麦克风录音；
+    - 管理语音识别；
+    - 管理视觉查询；
+    - 管理 LLM 闲聊兜底；
+    - 管理 TTS 播报。
+    """
 
     def __init__(self, config=None, text_mode=False, vision_socket_path=DEFAULT_VISION_SOCKET_PATH):
+        """初始化语音助手。
+
+        参数：
+        - `config`：语音配置对象，默认创建 `VoiceConfig()`
+        - `text_mode`：是否使用文本模式模拟语音识别
+        - `vision_socket_path`：视觉模块 socket 路径
+
+        返回值：
+        - 无
+
+        说明：
+        - `text_mode=True` 时，不需要麦克风和 Whisper，适合调试；
+        - 正常运行时会启动 TTS 请求服务器、Whisper 识别器和视觉客户端。
+        """
         self.config = config or VoiceConfig()
         self.text_mode = text_mode
         self.mode = "standby"
@@ -254,6 +349,8 @@ class VoiceAssistant:
         self.vision_csv_path = DEFAULT_VISION_CSV_PATH
         self.legacy_vision_jsonl_path = LEGACY_VISION_JSONL_PATH
         self.legacy_vision_csv_path = LEGACY_VISION_CSV_PATH
+        self.threshold_config_path = DEFAULT_THRESHOLD_CONFIG_PATH
+        self.rk_alarm_log_path = RK_ALARM_LOG_PATH
         self.llm = LLMChat()
         self.tts_server = TTSRequestServer(self.broadcaster)
         if self.llm.enabled:
@@ -300,7 +397,7 @@ class VoiceAssistant:
         你可以直接在终端输入文字，验证唤醒词、模式切换、指令解析和播报。
         """
         print("========== 语音模块文本模拟模式 ==========")
-        print("直接输入：小杜你好 / 当前是什么模式 / 当前温度多少 / 当前电流多少 / 当前电压多少 / 烟雾状态 / 开始巡检 / 查询视觉状态 / 停止")
+        print("直接输入：小杜你好 / 当前是什么模式 / 当前温度多少 / 当前湿度多少 / 当前电压多少 / 当前电流多少 / 烟雾状态 / 开始巡检 / 查询视觉状态 / 停止")
         print("语音查询：有没有报警 / 最近一次报警是什么 / 报警几次了 / 帮我保存一下")
         print("如果终端中文输入有编码问题，也可以输入：wake / mode / temp / current / voltage / smoke / inspect / vision / stop")
         print("=========================================")
@@ -322,7 +419,9 @@ class VoiceAssistant:
 
     def handle_text(self, text):
         if contains_any(text, STOP_WORDS):
-            self.broadcaster.speak("好的，程序结束。")
+            reply = "好的，程序结束。"
+            self.write_voice_exchange_pair(text, reply, event="clear")
+            self.broadcaster.speak(reply)
             self.running = False
             return
 
@@ -330,11 +429,14 @@ class VoiceAssistant:
             if contains_any(text, WAKE_WORDS):
                 self.mode = "work"
                 self.last_work_time = time.time()
-                self.broadcaster.speak("我在，已进入工作模式。")
+                reply = "我在，已进入工作模式。"
+                self.write_voice_exchange_pair(text, reply)
+                self.broadcaster.speak(reply)
             elif self.text_mode and contains_any(text, DIRECT_TEXT_COMMAND_WORDS):
                 self.mode = "work"
                 self.last_work_time = time.time()
                 reply = self.build_reply(text)
+                self.write_voice_exchange_pair(text, reply)
                 self.broadcaster.speak(reply)
             else:
                 print("[模式] 待机模式，未检测到唤醒词")
@@ -342,22 +444,58 @@ class VoiceAssistant:
 
         self.last_work_time = time.time()
         reply = self.build_reply(text)
+        self.write_voice_exchange_pair(text, reply)
         self.broadcaster.speak(reply)
+
+    def write_voice_exchange_pair(self, user_text, bot_text, event="message"):
+        """把最近一轮语音对话写给 UI。
+
+        UI 的 VoiceWidget 每 500ms 读取 `.tmp/voice_last_exchange.json`。
+        顶层字段仍然保留 role/text/timestamp，兼容简单读取；
+        同时额外写入 messages，避免 UI 刷新慢时漏掉用户消息。
+        """
+        try:
+            VOICE_EXCHANGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            user_timestamp = datetime.now().isoformat(timespec="milliseconds")
+            bot_timestamp = datetime.now().isoformat(timespec="milliseconds")
+            data = {
+                "event": event,
+                "role": "bot",
+                "text": str(bot_text),
+                "timestamp": bot_timestamp,
+                "messages": [
+                    {"role": "user", "text": str(user_text), "timestamp": user_timestamp},
+                    {"role": "bot", "text": str(bot_text), "timestamp": bot_timestamp},
+                ],
+            }
+            with open(VOICE_EXCHANGE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[语音UI] 写入语音共享状态失败：{exc}")
 
     def build_reply(self, text):
         normalized = normalize_text(text)
 
+        if any(k in normalized for k in ["传感器状态", "设备状态", "系统状态", "传感器数值"]):
+            return self.reply_sensor_summary()
+
+        if "设备温度" in normalized or "机器温度" in normalized or "devicetemp" in normalized:
+            return self.reply_sensor_value("temp_device")
+
         if "温度" in normalized or "temp" in normalized:
-            return "当前温度正常。"
+            return self.reply_sensor_value("temperature")
+
+        if "湿度" in normalized or "humidity" in normalized:
+            return self.reply_sensor_value("humidity")
 
         if "电流" in normalized or "current" in normalized:
-            return "当前电流正常。"
+            return self.reply_sensor_value("current")
 
         if "电压" in normalized or "voltage" in normalized:
-            return "当前电压正常。"
+            return self.reply_voltage_status()
 
         if "烟雾" in normalized or "烟感" in normalized or "smoke" in normalized:
-            return "当前烟雾状态正常，未检测到烟雾报警。"
+            return self.reply_sensor_value("smoke")
 
         if "模式" in normalized or "mode" in normalized:
             if self.mode == "work":
@@ -368,7 +506,7 @@ class VoiceAssistant:
             self.mode = "standby"
             return "好的，已返回待机模式。"
 
-        if any(k in normalized for k in ["有没有报警", "报警记录", "最近一次报警", "报警几次", "报警了几次", "报了几次", "报警次数", "帮我保存"]):
+        if any(k in normalized for k in ["有没有报警", "有无报警", "报警记录", "最近一次报警", "报警几次", "报警了几次", "报了几次", "报警次数", "帮我保存"]):
             return self.reply_alarm_query(normalized)
 
         if (
@@ -419,13 +557,15 @@ class VoiceAssistant:
         if intent == "trigger_inspection":
             return self.reply_trigger_inspection()
         if intent == "temperature":
-            return "当前温度正常。"
+            return self.reply_sensor_value("temperature")
+        if intent == "humidity":
+            return self.reply_sensor_value("humidity")
         if intent == "current":
-            return "当前电流正常。"
+            return self.reply_sensor_value("current")
         if intent == "voltage":
-            return "当前电压正常。"
+            return self.reply_voltage_status()
         if intent == "smoke":
-            return "当前烟雾状态正常，未检测到烟雾报警。"
+            return self.reply_sensor_value("smoke")
         if intent == "mode":
             return "我当前处于工作模式。" if self.mode == "work" else "我当前处于待机模式。"
         if intent == "standby":
@@ -476,26 +616,36 @@ class VoiceAssistant:
             return self.manual_save_current_frame()
 
         latest_status = self.get_live_vision_status()
-        if latest_status and str(latest_status.get("status", "")).upper() == "ALARM":
-            reason = self.format_alarm_reason(latest_status.get("reason", ""))
-            person_count = latest_status.get("person_count", 0)
-            return f"现在有报警。检测人数 {person_count}。{reason}"
-
         records = self.load_alarm_records()
-        if not records:
-            return "今天还没有报警记录。"
+
+        if "报警几次" in normalized_text or "报警了几次" in normalized_text or "报警次数" in normalized_text or "报了几次" in normalized_text:
+            reply = f"历史报警记录里共有 {len(records)} 次报警。"
+            if self.is_live_alarm(latest_status):
+                reply += f" 当前也有报警，{self.format_live_alarm_reason(latest_status)}"
+            return reply
 
         if "最近一次报警" in normalized_text or "最近报警是什么" in normalized_text or "最后一条报警" in normalized_text:
+            if not records:
+                return "历史记录里还没有报警。"
             last = records[-1]
             return self.format_alarm_record_for_tts(last)
 
-        if "有没有报警" in normalized_text or "报警记录" in normalized_text or "报警有几条" in normalized_text:
+        if "报警记录" in normalized_text or "报警有几条" in normalized_text:
             count = len(records)
+            if not records:
+                return "历史记录里还没有报警。"
             last = records[-1]
             return f"今天共有 {count} 条报警记录。最近一次是 {self.format_alarm_record_for_short_tts(last)}"
 
-        if "报警几次" in normalized_text or "报警了几次" in normalized_text or "报警次数" in normalized_text or "报了几次" in normalized_text:
-            return f"当前已报警 {len(records)} 次。"
+        if "有没有报警" in normalized_text or "有无报警" in normalized_text:
+            if self.is_live_alarm(latest_status):
+                return f"现在有报警，{self.format_live_alarm_reason(latest_status)}"
+            if latest_status is None:
+                return "暂时读不到实时报警状态，请先确认仿真后端已经启动。"
+            return "当前没有报警。"
+
+        if self.is_live_alarm(latest_status):
+            return f"现在有报警，{self.format_live_alarm_reason(latest_status)}"
 
         return "我没有理解你的报警查询指令。"
 
@@ -511,6 +661,321 @@ class VoiceAssistant:
         except Exception as exc:
             print(f"[视觉连接] 实时报警状态查询失败：{exc}")
             return None
+
+    def is_live_alarm(self, status):
+        """判断实时状态是不是报警。
+
+        `status` 是仿真后端 socket 返回的字典，例如：
+            {"status": "ALARM", "reason": "环境温度过高 31.0°C"}
+        这里单独封装，是为了让“有无报警”和“报警几次”复用同一套判断。
+        """
+        if not status:
+            return False
+        return str(status.get("status", "")).upper() == "ALARM"
+
+    def format_live_alarm_reason(self, status):
+        """把实时报警状态整理成一句适合语音播报的话。"""
+        if not status:
+            return "原因未知。"
+
+        reason = self.format_alarm_reason(status.get("alarm_reason") or status.get("reason") or "")
+        alarm_type = self.format_alarm_type(status.get("alarm_type") or status.get("zone_name") or "")
+        person_count = status.get("person_count", 0)
+
+        parts = []
+        if reason:
+            if not reason.endswith(("。", "！", "!", ".")):
+                reason += "。"
+            parts.append(f"报警原因是{reason}")
+        if alarm_type:
+            parts.append(f"报警类型是{alarm_type}。")
+        parts.append(f"检测人数 {person_count}。")
+        return "".join(parts)
+
+    def get_live_system_status(self):
+        """读取“当前系统状态”，给语音查询传感器数值使用。
+
+        优先级：
+        1. 先读仿真后端 socket，这是最新、最实时的数据；
+        2. 如果 socket 没启动，再读 rk3588/alarm_log.csv 或视觉 records.csv 的最后一行。
+
+        这样做的好处是：
+        - 仿真后端运行时，语音回答能跟 UI 看到的数值同步；
+        - 后端没运行时，也能用最近一次日志给出尽量有用的回答。
+        """
+        live_status = self.get_live_vision_status()
+        if live_status:
+            return live_status
+        return self.read_latest_status_from_logs()
+
+    def read_latest_status_from_logs(self):
+        """从本地日志里读取最后一条状态，作为 socket 断开时的备用数据。"""
+        for csv_path in (self.rk_alarm_log_path, self.vision_csv_path, self.legacy_vision_csv_path):
+            row = self.read_latest_csv_row(csv_path)
+            if row:
+                return self.normalize_status_row(row)
+
+        for jsonl_path in (self.vision_jsonl_path, self.legacy_vision_jsonl_path):
+            row = self.read_latest_jsonl_row(jsonl_path)
+            if row:
+                return self.normalize_status_row(row)
+
+        return None
+
+    def read_latest_csv_row(self, csv_path):
+        """读取 CSV 最后一行。
+
+        这里没有用 pandas，是为了让小白同学以后也容易看懂：
+        csv.DictReader 会自动把表头变成字典 key。
+        """
+        if not csv_path.exists():
+            return None
+
+        latest = None
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    latest = row
+        except Exception as exc:
+            print(f"[传感器] 读取 CSV 失败：{csv_path}，{exc}")
+            return None
+        return latest
+
+    def read_latest_jsonl_row(self, jsonl_path):
+        """读取 JSONL 最后一行。
+
+        JSONL 是“一行一个 JSON 对象”的日志格式。
+        视觉模块历史记录里会用到它。
+        """
+        if not jsonl_path.exists():
+            return None
+
+        latest = None
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        latest = json.loads(line)
+        except Exception as exc:
+            print(f"[传感器] 读取 JSONL 失败：{jsonl_path}，{exc}")
+            return None
+        return latest
+
+    def normalize_status_row(self, row):
+        """把不同日志来源的字段名统一成语音模块认识的字段名。"""
+        data = dict(row)
+
+        # rk3588/alarm_log.csv 用 vision_status 表示视觉/系统状态；
+        # socket 和 records.csv 用 status。这里统一成 status。
+        if not data.get("status") and data.get("vision_status"):
+            data["status"] = data.get("vision_status")
+
+        # 有些记录会把报警原因放在 alarm_reason，有些放在 reason。
+        if not data.get("reason") and data.get("alarm_reason"):
+            data["reason"] = data.get("alarm_reason")
+
+        return data
+
+    def load_threshold_config(self):
+        """读取阈值配置。
+
+        UI 里改的温度/湿度/电流阈值会保存到 rk3588/config.json。
+        语音模块每次查询时重新读取一次，保证你改完阈值后不用重启语音。
+        """
+        threshold = dict(DEFAULT_THRESHOLD)
+        if not self.threshold_config_path.exists():
+            return threshold
+
+        try:
+            with open(self.threshold_config_path, "r", encoding="utf-8-sig") as f:
+                user_threshold = json.load(f)
+        except Exception as exc:
+            print(f"[传感器] 读取阈值配置失败：{exc}")
+            return threshold
+
+        for key in threshold:
+            if key in user_threshold:
+                threshold[key] = user_threshold[key]
+        return threshold
+
+    def to_float(self, value):
+        """把日志/socket 里的数值转成 float。
+
+        有时数据是 32.1，有时可能是 "32.1°C" 这样的字符串。
+        转换失败就返回 None，避免语音模块崩掉。
+        """
+        if value is None or value == "":
+            return None
+        try:
+            text = str(value).strip()
+            for unit in ("°C", "℃", "%", "A", "a", "V", "v", "度", "安", "伏"):
+                text = text.replace(unit, "")
+            return float(text)
+        except Exception:
+            return None
+
+    def to_int(self, value):
+        """把烟雾状态这类整数值安全转成 int。"""
+        number = self.to_float(value)
+        if number is None:
+            return None
+        return int(number)
+
+    def reply_sensor_value(self, sensor_name):
+        """回答单个传感器状态。
+
+        `sensor_name` 的可选值：
+        - temperature：环境温度
+        - humidity：环境湿度
+        - current：电流
+        - temp_device：设备温度
+        - smoke：烟雾
+        """
+        status = self.get_live_system_status()
+        if not status:
+            return "暂时读不到传感器数据，请先启动仿真后端。"
+
+        threshold = self.load_threshold_config()
+
+        if sensor_name == "temperature":
+            value = self.to_float(status.get("temperature"))
+            limit = self.to_float(threshold.get("temp_max"))
+            if value is None:
+                return "当前没有读到环境温度数值。"
+            if limit is not None and value > limit:
+                return f"当前环境温度 {value:.1f} 度，异常，超过上限 {limit:.1f} 度。"
+            limit_text = f"{limit:.1f}" if limit is not None else "未知"
+            return f"当前环境温度 {value:.1f} 度，正常，上限是 {limit_text} 度。"
+
+        if sensor_name == "humidity":
+            value = self.to_float(status.get("humidity"))
+            min_limit = self.to_float(threshold.get("humidity_min"))
+            max_limit = self.to_float(threshold.get("humidity_max"))
+            if value is None:
+                return "当前没有读到环境湿度数值。"
+            if min_limit is not None and value < min_limit:
+                return f"当前环境湿度 {value:.1f}%，异常，低于下限 {min_limit:.1f}%。"
+            if max_limit is not None and value > max_limit:
+                return f"当前环境湿度 {value:.1f}%，异常，超过上限 {max_limit:.1f}%。"
+            min_text = f"{min_limit:.1f}" if min_limit is not None else "未知"
+            max_text = f"{max_limit:.1f}" if max_limit is not None else "未知"
+            return f"当前环境湿度 {value:.1f}%，正常，范围是 {min_text}% 到 {max_text}%。"
+
+        if sensor_name == "current":
+            value = self.to_float(status.get("current"))
+            limit = self.to_float(threshold.get("current_max"))
+            if value is None:
+                return "当前没有读到电流数值。"
+            if limit is not None and value > limit:
+                return f"当前电流 {value:.2f} 安，异常，超过上限 {limit:.2f} 安。"
+            limit_text = f"{limit:.2f}" if limit is not None else "未知"
+            return f"当前电流 {value:.2f} 安，正常，上限是 {limit_text} 安。"
+
+        if sensor_name == "temp_device":
+            value = self.to_float(status.get("temp_device"))
+            limit = self.to_float(threshold.get("temp_device_max"))
+            if value is None:
+                return "当前没有读到设备温度数值。"
+            if limit is not None and value > limit:
+                return f"当前设备温度 {value:.1f} 度，异常，超过上限 {limit:.1f} 度。"
+            limit_text = f"{limit:.1f}" if limit is not None else "未知"
+            return f"当前设备温度 {value:.1f} 度，正常，上限是 {limit_text} 度。"
+
+        if sensor_name == "smoke":
+            smoke = self.to_int(status.get("smoke"))
+            smoke_alarm_enabled = int(self.to_float(threshold.get("smoke_alarm")) or 0)
+            if smoke is None:
+                return "当前没有读到烟雾数值。"
+            if smoke_alarm_enabled and smoke != 0:
+                return f"当前烟雾值 {smoke}，异常，已触发烟雾报警。"
+            return f"当前烟雾值 {smoke}，正常，未检测到烟雾报警。"
+
+        return "这个传感器我还不会查询。"
+
+    def reply_voltage_status(self):
+        """回答电压状态。
+
+        电压字段来自仿真后端 socket / 日志。
+        如果没有读到 voltage，语音模块不会假装正常，会明确告诉你缺数据。
+        """
+        status = self.get_live_system_status()
+        if not status:
+            return "暂时读不到传感器数据，请先启动仿真后端。"
+
+        voltage = self.to_float(status.get("voltage") or status.get("voltage_v"))
+        threshold = self.load_threshold_config()
+        min_limit = self.to_float(threshold.get("voltage_min"))
+        max_limit = self.to_float(threshold.get("voltage_max"))
+        if voltage is None:
+            return "当前系统还没有电压传感器数据，暂时不能判断电压是否正常。"
+        if min_limit is not None and voltage < min_limit:
+            return f"当前电压 {voltage:.1f} 伏，异常，低于下限 {min_limit:.1f} 伏。"
+        if max_limit is not None and voltage > max_limit:
+            return f"当前电压 {voltage:.1f} 伏，异常，超过上限 {max_limit:.1f} 伏。"
+        min_text = f"{min_limit:.1f}" if min_limit is not None else "未知"
+        max_text = f"{max_limit:.1f}" if max_limit is not None else "未知"
+        return f"当前电压 {voltage:.1f} 伏，正常，范围是 {min_text} 到 {max_text} 伏。"
+
+    def reply_sensor_summary(self):
+        """回答传感器总状态，并带上关键数值。"""
+        status = self.get_live_system_status()
+        if not status:
+            return "暂时读不到传感器数据，请先启动仿真后端。"
+
+        threshold = self.load_threshold_config()
+        temp = self.to_float(status.get("temperature"))
+        humidity = self.to_float(status.get("humidity"))
+        voltage = self.to_float(status.get("voltage") or status.get("voltage_v"))
+        current = self.to_float(status.get("current"))
+        temp_device = self.to_float(status.get("temp_device"))
+        smoke = self.to_int(status.get("smoke"))
+        temp_max = self.to_float(threshold.get("temp_max"))
+        humidity_min = self.to_float(threshold.get("humidity_min"))
+        humidity_max = self.to_float(threshold.get("humidity_max"))
+        voltage_min = self.to_float(threshold.get("voltage_min"))
+        voltage_max = self.to_float(threshold.get("voltage_max"))
+        current_max = self.to_float(threshold.get("current_max"))
+        temp_device_max = self.to_float(threshold.get("temp_device_max"))
+        smoke_alarm_enabled = int(self.to_float(threshold.get("smoke_alarm")) or 0)
+
+        problems = []
+        if temp is not None and temp_max is not None and temp > temp_max:
+            problems.append("环境温度过高")
+        if humidity is not None and humidity_min is not None and humidity < humidity_min:
+            problems.append("环境湿度过低")
+        if humidity is not None and humidity_max is not None and humidity > humidity_max:
+            problems.append("环境湿度过高")
+        if voltage is not None and voltage_min is not None and voltage < voltage_min:
+            problems.append("电压过低")
+        if voltage is not None and voltage_max is not None and voltage > voltage_max:
+            problems.append("电压过高")
+        if current is not None and current_max is not None and current > current_max:
+            problems.append("电流过载")
+        if temp_device is not None and temp_device_max is not None and temp_device > temp_device_max:
+            problems.append("设备温度过高")
+        if smoke is not None and smoke_alarm_enabled and smoke != 0:
+            problems.append("烟雾报警")
+
+        values = []
+        if temp is not None:
+            values.append(f"温度 {temp:.1f} 度")
+        if humidity is not None:
+            values.append(f"湿度 {humidity:.1f}%")
+        if voltage is not None:
+            values.append(f"电压 {voltage:.1f} 伏")
+        if current is not None:
+            values.append(f"电流 {current:.2f} 安")
+        if temp_device is not None:
+            values.append(f"设备温度 {temp_device:.1f} 度")
+        if smoke is not None:
+            values.append(f"烟雾值 {smoke}")
+
+        value_text = "，".join(values) if values else "暂无具体数值"
+        if problems:
+            return f"当前传感器异常：{'，'.join(problems)}。具体数值：{value_text}。"
+        return f"当前传感器正常。具体数值：{value_text}。"
 
     def is_alarm_record(self, record):
         """Return True when a JSONL/CSV row represents a visual alarm.

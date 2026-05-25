@@ -117,7 +117,15 @@ class MockVisionSocketServer:
         if cmd == "trigger_inspection":
             self.inspection_count += 1
             if self.inspection_count % 2 == 0:
-                self.latest_result = self._make_result("ALARM", 1, "模拟检测到人员进入右侧禁区")
+                self.latest_result = self._make_result(
+                    "ALARM",
+                    1,
+                    "模拟检测到人员进入右侧禁区",
+                    alarm_type="zone_intrusion",
+                    alarm_reason="人员进入右侧禁区",
+                    zone_hit=True,
+                    zone_name="right_third_zone",
+                )
             else:
                 self.latest_result = self._make_result("NORMAL", 1, "模拟巡检正常，检测到 1 名人员")
 
@@ -137,11 +145,24 @@ class MockVisionSocketServer:
 
         self._send(conn, {"ack": False, "cmd": cmd, "message": "unknown command"})
 
-    def _make_result(self, status, person_count, reason):
+    def _make_result(
+        self,
+        status,
+        person_count,
+        reason,
+        alarm_type="",
+        alarm_reason="",
+        zone_hit=False,
+        zone_name="",
+    ):
         return {
             "status": status,
             "person_count": person_count,
             "reason": reason,
+            "alarm_type": alarm_type if status == "ALARM" else "",
+            "alarm_reason": alarm_reason if status == "ALARM" else "",
+            "zone_hit": bool(zone_hit),
+            "zone_name": zone_name if status == "ALARM" else "",
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 

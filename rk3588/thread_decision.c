@@ -13,6 +13,7 @@
  * 这里直接引用，避免每个线程再重复加载配置文件。
  */
 extern ThresholdConfig g_threshold;
+extern pthread_mutex_t g_threshold_lock;
 
 /*
  * 来自 main.c 的全局消息队列句柄占位。
@@ -36,6 +37,27 @@ typedef struct {
     time_t timestamp;
 } AlarmMessage;
 
+static void append_reason(char *reason, size_t reason_size, const char *item)
+{
+    size_t used;
+
+    if (!reason || !item || reason_size == 0 || item[0] == '\0') {
+        return;
+    }
+
+    used = strlen(reason);
+    if (used == 0) {
+        snprintf(reason, reason_size, "%s", item);
+        return;
+    }
+
+    if (used + 1 >= reason_size) {
+        return;
+    }
+
+    snprintf(reason + used, reason_size - used, "；%s", item);
+}
+
 /*
  * 线程 2：决策融合线程。
  *
@@ -51,6 +73,15 @@ void *thread_decision(void *arg)
     int alarm_now = 0;
     char reason[128] = {0};
 
+    /*
+     * 这一线程就是“报警怎么判断”的核心。
+     *
+     * 你可以把它理解为：
+     * 1. 先把传感器和视觉线程更新好的状态读出来；
+     * 2. 再根据阈值做融合判断；
+     * 3. 最后决定要不要触发报警。
+     */
+
     if (!state) {
         return NULL;
     }
@@ -61,10 +92,11 @@ void *thread_decision(void *arg)
         float temp_device = 0.0f;
         float current = 0.0f;
         uint8_t smoke = 0;
+        ThresholdConfig threshold;
         char vision_status[16] = {0};
-        int person_count = 0;
         int zone_hit = 0;
         char alarm_type[32] = {0};
+        char alarm_reason[128] = {0};
         int prev_alarm_active = 0;
 
         pthread_mutex_lock(&state->lock);
@@ -74,17 +106,24 @@ void *thread_decision(void *arg)
         current = state->current;
         smoke = state->smoke;
         snprintf(vision_status, sizeof(vision_status), "%s", state->vision_status);
-        person_count = state->person_count;
         zone_hit = state->zone_hit;
         snprintf(alarm_type, sizeof(alarm_type), "%s", state->alarm_type);
+        snprintf(alarm_reason, sizeof(alarm_reason), "%s", state->alarm_reason);
         prev_alarm_active = state->alarm_active;
         pthread_mutex_unlock(&state->lock);
+
+        pthread_mutex_lock(&g_threshold_lock);
+        threshold = g_threshold;
+        pthread_mutex_unlock(&g_threshold_lock);
 
         alarm_now = 0;
         reason[0] = '\0';
 
         /*
          * 传感器报警判断。
+         *
+         * 传感器和视觉原因并列收集，最后统一决定是否报警。
+         * 这样多个异常同时发生时，报警原因不会互相覆盖。
          *
          * 重要参数来自 config.json：
          * - temp_max
@@ -94,41 +133,55 @@ void *thread_decision(void *arg)
          * - temp_device_max
          * - smoke_alarm
          */
-        if (temperature > g_threshold.temp_max) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "环境温度过高 %.1f°C", temperature);
-        } else if (humidity < g_threshold.humidity_min) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "湿度过低 %.1f%%", humidity);
-        } else if (humidity > g_threshold.humidity_max) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "湿度过高 %.1f%%", humidity);
-        } else if (current > g_threshold.current_max) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "电流过载 %.2fA", current);
-        } else if (temp_device > g_threshold.temp_device_max) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "设备温度过高 %.1f°C", temp_device);
-        } else if (g_threshold.smoke_alarm && smoke == 1) {
-            alarm_now = 1;
-            snprintf(reason, sizeof(reason), "检测到烟雾");
+        if (temperature > threshold.temp_max) {
+            char item[64];
+            snprintf(item, sizeof(item), "环境温度过高 %.1f°C", temperature);
+            append_reason(reason, sizeof(reason), item);
+        }
+        if (humidity < threshold.humidity_min) {
+            char item[64];
+            snprintf(item, sizeof(item), "湿度过低 %.1f%%", humidity);
+            append_reason(reason, sizeof(reason), item);
+        }
+        if (humidity > threshold.humidity_max) {
+            char item[64];
+            snprintf(item, sizeof(item), "湿度过高 %.1f%%", humidity);
+            append_reason(reason, sizeof(reason), item);
+        }
+        if (current > threshold.current_max) {
+            char item[64];
+            snprintf(item, sizeof(item), "电流过载 %.2fA", current);
+            append_reason(reason, sizeof(reason), item);
+        }
+        if (temp_device > threshold.temp_device_max) {
+            char item[64];
+            snprintf(item, sizeof(item), "设备温度过高 %.1f°C", temp_device);
+            append_reason(reason, sizeof(reason), item);
+        }
+        if (threshold.smoke_alarm && smoke != 0) {
+            append_reason(reason, sizeof(reason), "检测到烟雾");
         }
 
         /*
          * 视觉报警判断。
          *
-         * 说明：视觉模块如果处于 ALARM，并且命中禁区或报警类别，
-         * 那就直接参与融合报警。
+         * 这一段表示：除了传感器，视觉模块也能单独决定报警。
+         * 比如有人进入禁区，或者视觉模块直接判定为 ALARM，
+         * 那么决策线程也会把它当作报警依据。
          */
-        if (!alarm_now) {
-            if (strcmp(vision_status, "ALARM") == 0 && zone_hit) {
-                alarm_now = 1;
-                snprintf(reason, sizeof(reason), "人员进入禁区");
-            } else if (strcmp(vision_status, "ALARM") == 0 && alarm_type[0] != '\0') {
-                alarm_now = 1;
-                snprintf(reason, sizeof(reason), "%s", alarm_type);
+        if (strcmp(vision_status, "ALARM") == 0) {
+            if (alarm_reason[0] != '\0') {
+                append_reason(reason, sizeof(reason), alarm_reason);
+            } else if (alarm_type[0] != '\0') {
+                append_reason(reason, sizeof(reason), alarm_type);
+            } else if (zone_hit) {
+                append_reason(reason, sizeof(reason), "人员进入禁区");
+            } else {
+                append_reason(reason, sizeof(reason), "视觉检测到报警");
             }
         }
+
+        alarm_now = reason[0] != '\0';
 
         /*
          * 报警解除判断。

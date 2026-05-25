@@ -9,6 +9,21 @@
 #include <time.h>
 
 /*
+ * main.c 是 RK3588 端程序的总入口。
+ *
+ * 这一层只负责“组织各线程、组织共享状态、组织退出流程”，
+ * 不负责具体传感器采集、视觉识别或报警动作。
+ *
+ * 整体结构可以理解成：
+ * - main.c：总指挥
+ * - thread_sensor.c：传感器采集
+ * - thread_vision.c：视觉识别
+ * - thread_decision.c：报警决策
+ * - thread_alarm.c：报警执行
+ * - thread_heartbeat.c：心跳/在线状态
+ */
+
+/*
  * 线程入口声明。
  *
  * 每个线程单独放到独立的 .c 文件里，方便后面维护。
@@ -18,10 +33,16 @@ void *thread_vision(void *arg);
 void *thread_decision(void *arg);
 void *thread_alarm(void *arg);
 void *thread_heartbeat(void *arg);
+void *thread_control(void *arg);
 
 /*
  * 全局运行开关。
  * 信号处理函数把它置 0，所有线程看到后自行退出。
+ *
+ * 重要说明：
+ * - 这是一个“全局停止标志”；
+ * - 所有线程都要轮询它；
+ * - 这样按 Ctrl+C 时，系统能按统一流程退出。
  */
 volatile int g_running = 1;
 
@@ -36,6 +57,7 @@ SystemState g_state;
  * 由 config.json 读取，读取失败时自动使用默认值。
  */
 ThresholdConfig g_threshold;
+pthread_mutex_t g_threshold_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * 外设资源句柄。
@@ -49,10 +71,21 @@ void *g_alarm_queue = NULL;
 /*
  * 初始化系统状态。
  *
- * 说明：
- * 1. 把数值清零；
- * 2. 把状态字符串设成 UNKNOWN；
- * 3. 初始化互斥锁。
+ * 参数：
+ * - state：要初始化的共享状态结构体
+ *
+ * 返回值：
+ * - 无
+ *
+ * 流程：
+ * 1. 检查指针是否为空；
+ * 2. 清空整个结构体；
+ * 3. 把几个关键字符串初始化成 UNKNOWN 或空字符串；
+ * 4. 初始化互斥锁，保证多线程读写安全。
+ *
+ * 原理：
+ * - 多线程同时读写同一个结构体，如果没有锁，可能出现“读到一半”的脏数据；
+ * - 所以这个共享状态必须配合 mutex 使用。
  */
 static void init_system_state(SystemState *state)
 {
@@ -63,6 +96,7 @@ static void init_system_state(SystemState *state)
     memset(state, 0, sizeof(*state));
     snprintf(state->vision_status, sizeof(state->vision_status), "UNKNOWN");
     snprintf(state->alarm_type, sizeof(state->alarm_type), "");
+    snprintf(state->alarm_reason, sizeof(state->alarm_reason), "");
     snprintf(state->last_alarm_reason, sizeof(state->last_alarm_reason), "");
     pthread_mutex_init(&state->lock, NULL);
 }
@@ -77,6 +111,18 @@ static void init_system_state(SystemState *state)
  */
 static void handle_signal(int sig)
 {
+    /*
+     * 信号处理函数。
+     *
+     * 参数：
+     * - sig：信号编号，比如 SIGINT（Ctrl+C）或 SIGTERM
+     *
+     * 原理：
+     * - 进程收到退出信号后，不要立刻粗暴结束所有线程；
+     * - 而是先把 g_running 设为 0；
+     * - 各个线程在自己的循环里看到这个标志后，自己退出；
+     * - 这样能保证资源释放顺序更安全。
+     */
     (void)sig;
     g_running = 0;
     printf("[MAIN] 收到退出信号，准备关闭系统...\n");
@@ -95,11 +141,30 @@ static void handle_signal(int sig)
  */
 int main(void)
 {
+    /*
+     * main() 是 RK3588 主程序入口。
+     *
+     * 入口参数：
+     * - 无
+     *
+     * 返回值：
+     * - 0：正常退出
+     * - 1：线程启动失败或初始化失败
+     *
+     * 总流程：
+     * 1. 初始化共享状态；
+     * 2. 读取阈值配置；
+     * 3. 注册信号处理；
+     * 4. 启动各业务线程；
+     * 5. 等待线程退出；
+     * 6. 清理资源并返回。
+     */
     pthread_t tid_sensor;
     pthread_t tid_vision;
     pthread_t tid_decision;
     pthread_t tid_alarm;
     pthread_t tid_heartbeat;
+    pthread_t tid_control;
 
     init_system_state(&g_state);
 
@@ -150,6 +215,16 @@ int main(void)
         pthread_join(tid_alarm, NULL);
         return 1;
     }
+    if (pthread_create(&tid_control, NULL, thread_control, &g_state) != 0) {
+        printf("[MAIN] 启动控制命令线程失败\n");
+        g_running = 0;
+        pthread_join(tid_sensor, NULL);
+        pthread_join(tid_vision, NULL);
+        pthread_join(tid_decision, NULL);
+        pthread_join(tid_alarm, NULL);
+        pthread_join(tid_heartbeat, NULL);
+        return 1;
+    }
 
     printf("[MAIN] 系统已启动，按 Ctrl+C 退出\n");
 
@@ -166,6 +241,7 @@ int main(void)
     pthread_join(tid_decision, NULL);
     pthread_join(tid_alarm, NULL);
     pthread_join(tid_heartbeat, NULL);
+    pthread_join(tid_control, NULL);
 
     /*
      * 退出前统一关闭外设与队列。
@@ -177,6 +253,7 @@ int main(void)
     g_alarm_queue = NULL;
 
     pthread_mutex_destroy(&g_state.lock);
+    pthread_mutex_destroy(&g_threshold_lock);
     printf("系统正常退出\n");
     return 0;
 }

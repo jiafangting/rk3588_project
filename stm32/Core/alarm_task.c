@@ -6,7 +6,10 @@
  */
 
 #include "alarm_task.h"
+#include "FreeRTOS.h"
 #include "freertos_config.h"
+#include "queue.h"
+#include "task.h"
 #include <stdio.h>
 
 /* 报警队列句柄 */

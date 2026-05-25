@@ -1,11 +1,27 @@
 """通用语音播报模块。
 
-这个文件给视觉模块、语音助手、测试脚本共用。
+这个文件负责把文本真正说出来。
+它本身不负责理解语义，只负责“播报执行”。
 
+主要用途：
+1. 视觉模块需要播报报警时调用它；
+2. 语音模块收到文本回复时调用它；
+3. 测试脚本也可以直接调用它。
+
+流程：
+- 外部调用 `speak()` 或 `request_tts()`；
+- 文本进入队列；
+- 后台线程逐条播报；后台队列播报，不阻塞主流程；
+- 如果 pyttsx3 失败，就自动使用 PowerShell 作为兜底；
+- 播报时通过文件标志避免麦克风回录。
 特点：
     1. 后台队列播报，不阻塞主流程；
     2. 优先使用 pyttsx3；
     3. pyttsx3 / sapi5 失败时，自动使用 PowerShell System.Speech 兜底。
+关键参数：
+- `rate`：语速，默认 180
+- `volume`：音量，默认 1.0
+- `DEFAULT_TTS_HOST` / `DEFAULT_TTS_PORT`：跨进程 TTS 请求端口
 """
 
 import queue
@@ -25,11 +41,15 @@ DEFAULT_TTS_PORT = 8766
 
 
 def is_tts_active():
-    """Return whether any system TTS is currently speaking.
+    """判断当前是否正在播报。
 
-    The flag is intentionally file based so independent processes can see it.
-    The voice recorder checks this flag before and during recording to avoid
-    recording the speaker output and feeding it back into ASR.
+    返回值：
+    - `True`：正在播报
+    - `False`：当前没有播报
+
+    原理：
+    使用一个文件标志 `.tmp/tts_active.flag` 作为跨进程信号。
+    这样视觉进程、语音进程、录音进程都能看见同一个状态。
     """
     return TTS_ACTIVE_FLAG.exists()
 
@@ -46,11 +66,22 @@ def _set_tts_active(active):
 
 
 def request_tts(text, host=DEFAULT_TTS_HOST, port=DEFAULT_TTS_PORT, timeout=1.0):
-    """Ask the voice process to speak text.
+    """向语音进程请求播报文本。
 
-    Visual code calls this before falling back to local pyttsx3. When the voice
-    process is running, all TTS goes through one VoiceBroadcaster queue, so the
-    voice loop can wait for it before opening the microphone.
+    参数：
+    - `text`：要播报的文本
+    - `host`：TTS 服务地址
+    - `port`：TTS 服务端口
+    - `timeout`：连接和等待响应的超时
+
+    返回值：
+    - `True`：请求成功，已进入播报队列
+    - `False`：请求失败，调用方可继续本地兜底播报
+
+    原理：
+    - 其他进程把文本打包成 JSON；
+    - 发给语音进程的 TCP 服务；
+    - 语音进程将文本放进队列，统一播报。
     """
     if not text:
         return False
@@ -69,7 +100,18 @@ def request_tts(text, host=DEFAULT_TTS_HOST, port=DEFAULT_TTS_PORT, timeout=1.0)
 
 
 class TTSRequestServer:
-    """Small TCP server that lets other processes request voice playback."""
+    """TTS 请求服务器。
+
+    作用：
+    - 接收其他进程发来的 speak 命令；
+    - 把文本交给 `VoiceBroadcaster`；
+    - 统一由一个播报队列执行。
+
+    这样设计的好处是：
+    - 避免多个进程同时开音频设备；
+    - 避免播报和录音互相干扰；
+    - 保持语音出口统一。
+    """
 
     def __init__(self, broadcaster, host=DEFAULT_TTS_HOST, port=DEFAULT_TTS_PORT):
         self.broadcaster = broadcaster
@@ -142,7 +184,16 @@ class TTSRequestServer:
 
 
 class VoiceBroadcaster:
-    """后台语音播报器。"""
+    """后台语音播报器。
+
+    这是整个播报系统的执行核心：
+    - 外部调用 `speak()` 只是把文本放进队列；
+    - 后台线程才真正调用 TTS 引擎播报。
+
+    重要参数：
+    - `rate`：语速，越大越快
+    - `volume`：音量，1.0 通常是最大
+    """
 
     def __init__(self, rate=180, volume=1.0):
         self.rate = rate

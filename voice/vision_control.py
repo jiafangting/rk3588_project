@@ -34,6 +34,10 @@ DEFAULT_VISION_TCP_PORT = 8765
 class VisionSocketClient:
     """Unix Domain Socket 客户端。
 
+    这里可以理解成“语音模块去问视觉模块问题”的小工具。
+    它不负责做视觉识别，只负责发命令、收结果，再把结果交给
+    上层语音逻辑去播报。
+
     Python 视觉模块和 C 主控使用同一套 JSON 协议：
 
         {"cmd": "get_status"}
@@ -48,9 +52,11 @@ class VisionSocketClient:
         self.tcp_port = tcp_port
 
     def get_status(self):
+        # 查询“当前视觉状态”。UI 和语音都经常用这个命令。
         return self._send_command({"cmd": "get_status"})
 
     def trigger_inspection(self):
+        # 让视觉/仿真模块立刻保存一次结果，方便做“帮我保存一下”。
         return self._send_command({"cmd": "trigger_inspection"})
 
     def _send_command(self, payload):

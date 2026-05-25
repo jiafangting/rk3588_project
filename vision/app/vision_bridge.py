@@ -1,8 +1,10 @@
-"""vision_bridge.py
+"""视觉联动桥模块。
 
-视觉联动桥模块。
+这个模块的职责是：把“视觉识别结果”进一步变成系统动作和历史记录。
 
-这个模块负责把“视觉识别结果”变成后续动作：
+它不负责识别画面；识别已经在 `vision_core.py` 和 `vision_pipeline.py` 里完成。
+它负责的是识别完成之后的联动动作：
+
 1. 自动保存报警截图
 2. 自动写入报警日志
 3. 自动触发 TTS 文本
@@ -10,10 +12,23 @@
 5. 记录最近一次报警截图，供屏幕联动显示
 6. 供语音查询模块读取报警统计
 
+流程：
+- 视觉主流程识别出结果；
+- `VisionBridge.handle_alarm()` 把结果变成报警记录；
+- `VisionBridge.manual_snapshot()` 把手动保存变成记录；
+- `query_alarm_records()` 给语音模块做文本查询；
+- `save_alarm_video_if_enabled()` 在开启配置时保存短视频。
+
+关键参数：
+- `ENABLE_VIDEO_CLIP_SAVE`：是否保存短视频
+- `ALARM_CLIP_SECONDS`：短视频时长
+- `ALARM_CLIP_FPS`：短视频帧率
+- `ALARM_COOLDOWN_SECONDS`：报警冷却时间
+
 设计原则：
 - 主流程只负责识别，不要把所有联动逻辑都塞进去；
 - 保存、查询、外设控制尽量在这个桥模块里统一收口；
-- 所有关键参数都集中在 config.py。
+- 所有关键参数都集中在 `config.py`。
 """
 
 from __future__ import annotations
@@ -34,6 +49,22 @@ from config import (
     OUTPUT_DIR,
 )
 from vision_logger import save_alarm_clip, save_record, save_snapshot_record
+
+
+def normalize_alarm_fields(decision):
+    if getattr(decision, "status", "") != "ALARM":
+        return "", ""
+    if getattr(decision, "zone_hit", False):
+        return "zone_intrusion", "人员进入右侧禁区"
+    if getattr(decision, "alarm_label", "") == "smoke":
+        return "smoke", "检测到烟雾"
+    if getattr(decision, "alarm_label", "") in ("fire", "flame"):
+        return "fire", "检测到明火"
+    if getattr(decision, "alarm_label", ""):
+        return str(decision.alarm_label), decision.reason or "视觉检测到报警目标"
+    if getattr(decision, "alarm_name", ""):
+        return str(decision.alarm_name), decision.reason or str(decision.alarm_name)
+    return "vision_alarm", decision.reason or "视觉检测到报警"
 
 
 # =========================
@@ -148,14 +179,15 @@ class VisionBridge:
             csv_path=csv_path,
         )
 
+        alarm_type, alarm_reason = normalize_alarm_fields(decision)
         alarm_record = {
             **record,
-            "alarm_type": decision.alarm_name or decision.zone_name or "ALARM",
+            "alarm_type": alarm_type,
             "alarm_time": record.get("timestamp", ""),
             "zone_name": decision.zone_name or "",
             "intruded_people": decision.intruded_people,
             "alarm_frame_count": decision.alarm_frame_count,
-            "alarm_reason": decision.reason,
+            "alarm_reason": alarm_reason,
             "speech_text": speech_text,
             "raw_path": str(raw_path),
             "result_path": str(result_path),

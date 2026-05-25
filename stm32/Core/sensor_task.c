@@ -6,10 +6,12 @@
  */
 
 #include "sensor_task.h"
-#include "uart_protocol.h"
 
+#include "FreeRTOS.h"
 #include "freertos_config.h"
 #include "main.h"
+#include "queue.h"
+#include "task.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -25,7 +27,13 @@
 extern I2C_HandleTypeDef hi2c1;
 extern ADC_HandleTypeDef hadc1;
 
-/* 任务队列句柄（建议由 main.c 创建并传入） */
+/*
+ * 传感器数据队列句柄（建议由 main.c 创建并传入）。
+ *
+ * 当前版本中，传感器任务只负责把 SensorData_t 放入 gSensorQueue。
+ * UART 发送任务会从该队列取出数据，再调用 uart_send_sensor_frame()
+ * 上报给 RK3588。
+ */
 extern QueueHandle_t gSensorQueue;
 
 /*============================================================
@@ -228,16 +236,19 @@ void vSensorTask(void *pvParameters)
 
         data.timestamp = HAL_GetTick();
 
-        /* 数据入队：如果队列满，FreeRTOS 会按配置阻塞等待 */
+        /*
+         * 数据入队：
+         * 传感器任务只负责采集并把数据放入 gSensorQueue。
+         * UART 发送任务负责从 gSensorQueue 取数据并上报 RK3588。
+         */
         if (gSensorQueue) {
             BaseType_t ok = xQueueSend(gSensorQueue, &data, pdMS_TO_TICKS(50));
             if (ok != pdPASS) {
                 printf("[SENSOR] SensorQueue 满，数据暂时无法入队\n");
             }
+        } else {
+            printf("[SENSOR] gSensorQueue 未创建，传感器数据无法入队\n");
         }
-
-        /* 采集完成后通过串口发送上行帧 */
-        uart_send_sensor_frame(&data);
 
         /* 更新心跳 */
         /* 若你的工程里有全局心跳表，可在这里补充 */

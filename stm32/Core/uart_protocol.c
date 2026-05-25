@@ -7,14 +7,20 @@
 
 #include "uart_protocol.h"
 #include "alarm_task.h"
+#include "FreeRTOS.h"
 #include "freertos_config.h"
+#include "queue.h"
+#include "task.h"
 #include <stdio.h>
 #include <string.h>
 
 /* 外设句柄 */
 extern UART_HandleTypeDef huart1;
 
-/* 报警队列句柄 */
+/* 传感器数据队列句柄 */
+extern QueueHandle_t gSensorQueue;
+
+/* 报警命令队列句柄 */
 extern QueueHandle_t gAlarmQueue;
 
 /*
@@ -75,6 +81,35 @@ void uart_send_sensor_frame(SensorData_t *data)
     /* 注意：这里发送长度按实际拼包长度计算，而不是死盯宏值，避免结构差异造成问题。 */
     if (HAL_UART_Transmit(&huart1, frame, 1 + idx + 2, 100) != HAL_OK) {
         printf("[UART] 上行传感器帧发送失败\n");
+    }
+}
+
+/*
+ * @brief FreeRTOS 串口发送任务。
+ *
+ * 作用：
+ * - 传感器任务只负责采集并写入 gSensorQueue；
+ * - 本任务从 gSensorQueue 取出 SensorData_t；
+ * - 再调用 uart_send_sensor_frame() 发给 RK3588。
+ */
+void uart_sensor_send_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    SensorData_t data;
+
+    printf("[UART] 串口传感器发送任务启动\n");
+
+    while (1) {
+        if (!gSensorQueue) {
+            printf("[UART] gSensorQueue 未创建，等待传感器队列...\n");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (xQueueReceive(gSensorQueue, &data, portMAX_DELAY) == pdPASS) {
+            uart_send_sensor_frame(&data);
+        }
     }
 }
 

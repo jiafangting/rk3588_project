@@ -8,13 +8,28 @@
 /*
  * 线程 3：报警执行线程。
  *
- * 当前版本先实现“报警动作执行”框架：
- * - 监听决策后的报警状态；
- * - 打印报警日志；
- * - 预留串口给 STM32 发蜂鸣器 / LED 指令；
- * - 追加写 CSV 报警记录。
+ * 这个线程负责“真正执行报警动作”。
+ * 它不做判断，判断结果来自 `thread_decision.c`。
+ * 它只关心：
+ * - 现在是不是报警；
+ * - 报警有没有从 0 变成 1；
+ * - 报警有没有从 1 变回 0。
+ * - 报警持续期间，报警原因有没有变化。
  *
- * 后面如果你把消息队列补上，这里可以直接切换成 mq_receive。
+ * 流程：
+ * 1. 读取共享状态中的 `alarm_active`；
+ * 2. 如果是新报警，给 STM32 发“开启报警”命令；
+ * 3. 写报警日志；
+ * 4. 更新报警次数；
+ * 5. 如果报警解除，给 STM32 发“关闭报警”命令；
+ * 6. 如果报警持续但原因变化，补写一条原因更新日志；
+ * 7. 更新心跳；
+ * 8. 休眠一小段时间后继续轮询。
+ *
+ * 重要参数：
+ * - `msg.level = 2`：严重报警
+ * - `msg.level = 0`：报警解除
+ * - `usleep(200 * 1000)`：200ms 轮询一次，保证响应快
  */
 
 /* 报警消息结构，和决策线程保持一致。 */
@@ -69,6 +84,7 @@ void *thread_alarm(void *arg)
 {
     SystemState *state = (SystemState *)arg;
     int last_alarm_active = 0;
+    char last_logged_reason[128] = {0};
 
     if (!state) {
         return NULL;
@@ -102,6 +118,21 @@ void *thread_alarm(void *arg)
             pthread_mutex_unlock(&state->lock);
 
             printf("[ALARM] %ld | %s\n", (long)msg.timestamp, msg.reason);
+            snprintf(last_logged_reason, sizeof(last_logged_reason), "%s", reason);
+        }
+
+        if (alarm_active && last_alarm_active &&
+            reason[0] != '\0' &&
+            strcmp(reason, last_logged_reason) != 0) {
+            AlarmMessage msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.level = 1;
+            snprintf(msg.reason, sizeof(msg.reason), "报警原因更新：%s", reason);
+            msg.timestamp = time(NULL);
+
+            append_alarm_csv(&msg);
+            snprintf(last_logged_reason, sizeof(last_logged_reason), "%s", reason);
+            printf("[ALARM] %ld | %s\n", (long)msg.timestamp, msg.reason);
         }
 
         if (!alarm_active && last_alarm_active) {
@@ -114,6 +145,7 @@ void *thread_alarm(void *arg)
             send_alarm_cmd_to_stm32(0);
             append_alarm_csv(&msg);
             printf("[ALARM] %ld | %s\n", (long)msg.timestamp, msg.reason);
+            last_logged_reason[0] = '\0';
         }
 
         last_alarm_active = alarm_active;

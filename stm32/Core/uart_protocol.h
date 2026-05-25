@@ -61,6 +61,18 @@ uint8_t uart_calc_checksum(uint8_t *buf, uint16_t len);
 void uart_send_sensor_frame(SensorData_t *data);
 
 /*
+ * @brief FreeRTOS 串口发送任务。
+ * @param pvParameters 任务参数，通常为空。
+ * @return 无返回值。
+ *
+ * 说明：
+ * - 从 gSensorQueue 读取 SensorData_t；
+ * - 调用 uart_send_sensor_frame() 上报给 RK3588；
+ * - 让传感器采集任务和串口发送任务解耦。
+ */
+void uart_sensor_send_task(void *pvParameters);
+
+/*
  * @brief 报警指令帧解析。
  * @param buf 接收到的 3 字节帧。
  * @param cmd_out 解析得到的指令输出。

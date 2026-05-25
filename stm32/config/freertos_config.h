@@ -40,7 +40,7 @@
 
 /* 消息队列长度
  * 说明：队列满时发送方会阻塞等待
- * SensorQueue：存放传感器数据帧，8条够用（500ms采集一次）
+ * SensorQueue：存放传感器数据帧，供 UART 发送任务读取
  * AlarmQueue：存放报警指令，4条足够 */
 #define SENSOR_QUEUE_LENGTH   8
 #define ALARM_QUEUE_LENGTH    4

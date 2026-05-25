@@ -12,6 +12,22 @@ import cv2
 from vision_core import build_speech_text
 
 
+def normalize_alarm_fields(decision):
+    if getattr(decision, "status", "") != "ALARM":
+        return "", ""
+    if getattr(decision, "zone_hit", False):
+        return "zone_intrusion", "人员进入右侧禁区"
+    if getattr(decision, "alarm_label", "") == "smoke":
+        return "smoke", "检测到烟雾"
+    if getattr(decision, "alarm_label", "") in ("fire", "flame"):
+        return "fire", "检测到明火"
+    if getattr(decision, "alarm_label", ""):
+        return str(decision.alarm_label), decision.reason or "视觉检测到报警目标"
+    if getattr(decision, "alarm_name", ""):
+        return str(decision.alarm_name), decision.reason or str(decision.alarm_name)
+    return "vision_alarm", decision.reason or "视觉检测到报警"
+
+
 def ensure_parent_dir(file_path):
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -152,15 +168,16 @@ def save_snapshot_record(preview, result_image, stable_status, decision, output_
     )
 
     if decision.status == "ALARM":
+        alarm_type, alarm_reason = normalize_alarm_fields(decision)
         alarm_record = build_alarm_record(
-            alarm_type=decision.alarm_name or decision.zone_name or "ALARM",
+            alarm_type=alarm_type,
             alarm_time=_now_text(),
             zone_name=decision.zone_name or "",
             intruded_people=decision.intruded_people,
             alarm_frame_count=decision.alarm_frame_count,
             raw_path=str(raw_path),
             result_path=str(result_path),
-            alarm_reason=decision.reason,
+            alarm_reason=alarm_reason,
             speech_text=speech_text,
         )
         save_record(alarm_record, str(jsonl_path), str(csv_path))

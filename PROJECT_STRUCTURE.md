@@ -2,6 +2,10 @@
 
 离线工业巡检系统，由 STM32 采集传感器、RK3588 上的 C 主控做融合决策、Python 视觉/语音模块做检测和交互、PyQt 上位机做可视化。
 
+> 说明
+>
+> 下面的目录说明尽量按“新人学习顺序”来写：先看整体，再看单个模块，最后看启动和部署入口。
+
 ## 顶层目录
 
 ```text
@@ -18,6 +22,14 @@ rk3588_project/
 ├── PROJECT_STRUCTURE.md
 └── .gitignore
 ```
+
+**说明**
+
+- `rk3588/` 是运行在 RK3588 上的 C 主控目录，负责多线程调度和报警决策。
+- `stm32/` 是底层采集端，主要负责传感器和执行器。
+- `vision/` 和 `voice/` 是 Python 侧能力模块，分别负责视觉和语音。
+- `ui/` 是图形界面，适合做演示和参数调整。
+- `scripts/` 是最常见的启动入口，建议先从这里跑通项目。
 
 ## rk3588/ — C 主控（当前版本）
 
@@ -40,7 +52,19 @@ rk3588/
 └── project_开发日志.md
 ```
 
+**关键说明**
+
+- `main.c` 是总入口，只负责“启动线程 + 收尾退出”，不写业务逻辑。
+- `system_state.h` 是所有线程共享的数据中心。
+- `threshold_config.c/.h` 负责读取 `config.json`，并在配置缺失时提供默认值。
+- `thread_sensor.c` / `thread_vision.c` / `thread_decision.c` / `thread_alarm.c` / `thread_heartbeat.c` 分别对应采集、视觉查询、决策、报警和健康检查。
+
 构建：`cd rk3588 && make` → `./inspection`
+
+> 注意
+>
+> - `config.json` 里的阈值影响报警判断结果；
+> - 如果模型、socket 或串口暂时不可用，代码里通常会有降级逻辑，方便先跑通整体流程。
 
 ## stm32/ — STM32 端
 
@@ -54,6 +78,12 @@ stm32/
 ├── docs/stm32_开发日志.md
 └── README.md
 ```
+
+**说明**
+
+- `sensor_task.c` 一般负责采样；
+- `alarm_task.c` 一般负责执行器输出；
+- `uart_protocol.c` 定义和 RK3588 通信的协议格式。
 
 ## vision/ — Python 视觉
 
@@ -78,6 +108,14 @@ vision/
 └── vision_开发日志.md
 ```
 
+**说明**
+
+- `config.py` 是视觉模块参数集中地，建议改参数先看这里。
+- `startup.py` 负责启动前检查，避免主循环一开始就报错。
+- `vision_main.py` 只是入口，真正逻辑在 `vision_pipeline.py`。
+- `vision_socket.py` 是对外状态服务，UI、语音和 C 主控都可能查询它。
+- `vision_bridge.py` 负责把“识别结果”变成“日志、截图、查询数据”。
+
 ## voice/ — Python 语音
 
 ```text
@@ -90,6 +128,12 @@ voice/
 ├── README.md
 └── voice_开发日志.md
 ```
+
+**说明**
+
+- `voice_loop.py` 是语音模块总入口；
+- `voice_broadcast.py` 负责真正播报；
+- `vision_control.py` 负责语音侧查询视觉状态。
 
 ## ui/ — PyQt 上位机
 
@@ -106,6 +150,12 @@ ui/
 └── ui_开发日志.md
 ```
 
+**说明**
+
+- `main_window.py` 负责组织整个界面；
+- `ui_state.py` 是 UI 的统一数据中枢；
+- `widgets/` 里每个文件对应一个功能面板。
+
 ## scripts/ — 启动入口
 
 ```text
@@ -118,20 +168,40 @@ scripts/
 └── alarm_voice_demo.py  # 答辩演示用单文件最小闭环
 ```
 
-常用命令（项目根目录下）：
+**常用命令说明**
 
 ```bash
 # 调试：仅 Python（视觉 + 语音）
 D:\anaconda3\envs\rk3588-ai\python.exe scripts/run_device.py
+```
 
+- 作用：启动 Python 侧的视觉和语音联动。
+- 使用场景：没有先上 C 主控时，先验证 Python 联调。
+- 前置条件：安装好 Python 环境和依赖。
+- 注意事项：如果摄像头、模型或音频设备没装好，可能先报错。
+
+```bash
 # 文本模式语音（不用麦克风）
 D:\anaconda3\envs\rk3588-ai\python.exe scripts/run_device.py --voice-text
+```
 
+- 作用：使用文本输入代替麦克风，方便调试。
+- 使用场景：没有麦克风、想快速测试语音逻辑。
+- 前置条件：语音模块依赖已安装。
+- 注意事项：适合学习和联调，不代表最终语音硬件流程。
+
+```bash
 # 现场：C 主控 + Python 全启
 bash scripts/start_system.sh
 bash scripts/health_check.sh
 bash scripts/stop_system.sh
 ```
+
+- `start_system.sh`：启动全系统。
+- `health_check.sh`：检查是否都有起来。
+- `stop_system.sh`：结束所有相关进程。
+- 使用场景：Linux 部署或正式演示。
+- 注意事项：脚本通常依赖 systemd、socket、模型路径和权限。
 
 ## deploy/ — systemd 部署
 
@@ -141,9 +211,24 @@ deploy/
 └── install_service.sh   # 复制到 /etc/systemd/system/ 并 enable
 ```
 
+**说明**
+
+- `inspection.service` 是 systemd 服务文件，用于开机自启或后台守护。
+- `install_service.sh` 负责安装和启用服务。
+
+> 注意
+>
+> - 部署前通常需要把路径改成机器上的真实路径；
+> - 如果服务启动失败，优先检查 `ExecStart`、工作目录和依赖环境。
+
 ## models/ — 模型权重
 
 只放权重文件，例如 `models/yolo11n/yolo11n.pt`。不要把 Ultralytics 源码塞进来，用 pip 装。
+
+**说明**
+
+- 这里存放的是 YOLO 模型权重。
+- 如果权重缺失，视觉模块通常无法正常启动。
 
 ## archive/ — 已废弃代码
 
@@ -165,6 +250,11 @@ archive/
 - `*.pt`、`*.onnx`、`*.rknn`、`*.engine`
 - `test.wav`
 
+**说明**
+
+- 这些目录或文件大多是运行时产物、缓存或大模型文件；
+- 不纳入版本控制可以减少仓库体积，也避免误提交临时文件。
+
 如果模型权重缺失，把 `yolo11n.pt` 放回 `models/yolo11n/`。
 
 ## 设备启动行为
@@ -177,3 +267,10 @@ archive/
 ├── 视觉正常时不打扰
 └── 视觉异常或决策报警时，触发语音播报 + 报警日志
 ```
+
+**流程解释**
+
+1. 设备上电后，RK3588 端先进入多线程主控状态。
+2. 视觉模块持续工作并把最新状态发布出来。
+3. 语音模块平时待机，收到唤醒后再工作。
+4. UI 则负责展示这些状态，方便观察和调试。

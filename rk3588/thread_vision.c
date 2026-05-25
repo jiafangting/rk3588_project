@@ -4,17 +4,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 /*
- * 视觉模块 Unix Socket 路径。
+ * 视觉模块 Unix Socket 路径和查询参数。
+ *
+ * 这个线程的工作不是做视觉识别，而是“定期问视觉模块现在是什么状态”。
  *
  * 重要参数：
- * - 必须和 Python 视觉模块一致；
- * - 连接失败不能崩溃，只能等下次重试；
- * - 查询频率默认 2 秒一次。
+ * - `VISION_SOCKET_ENV`：环境变量名，允许现场部署时改路径；
+ * - `DEFAULT_VISION_SOCKET_PATH`：默认 socket 路径；
+ * - `VISION_QUERY_INTERVAL_SEC`：每隔多少秒查询一次；
+ * - `VISION_SOCKET_TIMEOUT_SEC`：连接和读写超时时间。
+ *
+ * 原理：
+ * - 视觉模块和 RK3588 主控是两个独立进程；
+ * - 它们通过 Unix Socket 交换 JSON 数据；
+ * - 线程不断查询最新状态，更新到共享状态 `g_state`。
  */
 #define VISION_SOCKET_ENV "VISION_SOCKET_PATH"
 #define DEFAULT_VISION_SOCKET_PATH "/tmp/vision_inspection.sock"
@@ -47,6 +56,7 @@ static const char *get_vision_socket_path(void)
  * - person_count
  * - zone_hit
  * - alarm_type
+ * - alarm_reason
  *
  * 不依赖第三方库，只做字符串查找和基础解析。
  */
@@ -89,6 +99,44 @@ static int parse_int_field(const char *json, const char *key, int default_value)
     return atoi(p + 1);
 }
 
+static int parse_bool_field(const char *json, const char *key, int default_value)
+{
+    const char *p = strstr(json, key);
+    if (!p) {
+        return default_value;
+    }
+
+    p = strchr(p, ':');
+    if (!p) {
+        return default_value;
+    }
+    p++;
+
+    while (*p == ' ' || *p == '\t' || *p == '"') {
+        p++;
+    }
+
+    if (strncmp(p, "true", 4) == 0 || strncmp(p, "TRUE", 4) == 0) {
+        return 1;
+    }
+    if (strncmp(p, "false", 5) == 0 || strncmp(p, "FALSE", 5) == 0) {
+        return 0;
+    }
+
+    return atoi(p) != 0;
+}
+
+static void mark_vision_unknown(SystemState *state)
+{
+    pthread_mutex_lock(&state->lock);
+    snprintf(state->vision_status, sizeof(state->vision_status), "UNKNOWN");
+    state->person_count = 0;
+    state->zone_hit = 0;
+    snprintf(state->alarm_type, sizeof(state->alarm_type), "");
+    snprintf(state->alarm_reason, sizeof(state->alarm_reason), "");
+    pthread_mutex_unlock(&state->lock);
+}
+
 /*
  * 线程 1：视觉查询线程。
  *
@@ -100,6 +148,24 @@ static int parse_int_field(const char *json, const char *key, int default_value)
  */
 void *thread_vision(void *arg)
 {
+    /*
+     * 线程入口：视觉查询线程。
+     *
+     * 参数：
+     * - arg：`SystemState *`，共享状态指针
+     *
+     * 返回值：
+     * - `NULL`
+     *
+     * 流程：
+     * 1. 取出共享状态；
+     * 2. 连接视觉 socket；
+     * 3. 发送 `{"cmd":"get_status"}`；
+     * 4. 解析返回 JSON；
+     * 5. 更新视觉状态、人数、禁区命中、报警类型；
+     * 6. 更新心跳；
+     * 7. 睡眠后重试。
+     */
     SystemState *state = (SystemState *)arg;
 
     if (!state) {
@@ -121,9 +187,7 @@ void *thread_vision(void *arg)
         sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sockfd < 0) {
             printf("[VISION] 创建 socket 失败\n");
-            pthread_mutex_lock(&state->lock);
-            snprintf(state->vision_status, sizeof(state->vision_status), "UNKNOWN");
-            pthread_mutex_unlock(&state->lock);
+            mark_vision_unknown(state);
             sleep(VISION_QUERY_INTERVAL_SEC);
             continue;
         }
@@ -136,9 +200,7 @@ void *thread_vision(void *arg)
 
         if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             printf("[VISION] connect %s failed, wait for next retry\n", socket_path);
-            pthread_mutex_lock(&state->lock);
-            snprintf(state->vision_status, sizeof(state->vision_status), "UNKNOWN");
-            pthread_mutex_unlock(&state->lock);
+            mark_vision_unknown(state);
             close(sockfd);
             sleep(VISION_QUERY_INTERVAL_SEC);
             continue;
@@ -155,9 +217,7 @@ void *thread_vision(void *arg)
         close(sockfd);
         if (nread <= 0) {
             printf("[VISION] 未收到视觉模块返回\n");
-            pthread_mutex_lock(&state->lock);
-            snprintf(state->vision_status, sizeof(state->vision_status), "UNKNOWN");
-            pthread_mutex_unlock(&state->lock);
+            mark_vision_unknown(state);
             sleep(VISION_QUERY_INTERVAL_SEC);
             continue;
         }
@@ -170,29 +230,33 @@ void *thread_vision(void *arg)
          * - person_count
          * - zone_hit
          * - alarm_type
+         * - alarm_reason
          *
          * 这里不使用第三方库，保证 C99 环境下直接可编译。
          */
         char status[16] = {0};
         char alarm_type[32] = {0};
+        char alarm_reason[128] = {0};
         int person_count = 0;
         int zone_hit = 0;
 
         parse_string_field(buffer, "\"status\"", status, sizeof(status));
         parse_string_field(buffer, "\"alarm_type\"", alarm_type, sizeof(alarm_type));
+        parse_string_field(buffer, "\"alarm_reason\"", alarm_reason, sizeof(alarm_reason));
         person_count = parse_int_field(buffer, "\"person_count\"", 0);
-        zone_hit = parse_int_field(buffer, "\"zone_hit\"", 0);
+        zone_hit = parse_bool_field(buffer, "\"zone_hit\"", 0);
 
         pthread_mutex_lock(&state->lock);
         snprintf(state->vision_status, sizeof(state->vision_status), "%s", status[0] ? status : "UNKNOWN");
         state->person_count = person_count;
         state->zone_hit = zone_hit;
         snprintf(state->alarm_type, sizeof(state->alarm_type), "%s", alarm_type);
+        snprintf(state->alarm_reason, sizeof(state->alarm_reason), "%s", alarm_reason);
         state->heartbeat[1] = time(NULL);
         pthread_mutex_unlock(&state->lock);
 
-        printf("[VISION] status=%s person_count=%d zone_hit=%d alarm_type=%s\n",
-               status[0] ? status : "UNKNOWN", person_count, zone_hit, alarm_type);
+        printf("[VISION] status=%s person_count=%d zone_hit=%d alarm_type=%s alarm_reason=%s\n",
+               status[0] ? status : "UNKNOWN", person_count, zone_hit, alarm_type, alarm_reason);
 
         sleep(VISION_QUERY_INTERVAL_SEC);
     }

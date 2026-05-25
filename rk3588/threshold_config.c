@@ -7,8 +7,12 @@
 /*
  * 默认阈值。
  *
- * 这些值是文件不存在或解析失败时的保底值，
- * 保证系统没有 config.json 也能先跑起来。
+ * 这个函数的作用是：当 `config.json` 不存在、打不开、内容损坏时，
+ * 给系统一个能继续运行的保底配置。
+ *
+ * 为什么要这样做：
+ * - 工业软件不能因为配置文件坏了就直接崩掉；
+ * - 先用默认阈值保证系统可运行，再慢慢排查配置问题。
  */
 static void set_default_threshold(ThresholdConfig *cfg)
 {
@@ -71,6 +75,25 @@ static int parse_int_field(const char *text, const char *key, int *out)
 
 int load_threshold(const char *path, ThresholdConfig *cfg)
 {
+    /*
+     * 读取阈值配置。
+     *
+     * 参数：
+     * - path：config.json 文件路径
+     * - cfg：输出阈值结构体指针
+     *
+     * 返回值：
+     * - 0：成功读取或至少完成默认值初始化
+     * - -1：读取失败，cfg 中仍保留默认阈值
+     *
+     * 流程：
+     * 1. 先写默认值；
+     * 2. 打开 JSON 文件；
+     * 3. 读入整个文件；
+     * 4. 用字符串方式提取每个字段；
+     * 5. 释放内存；
+     * 6. 返回结果。
+     */
     FILE *fp = NULL;
     long file_size = 0;
     char *buf = NULL;

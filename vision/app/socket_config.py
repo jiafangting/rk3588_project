@@ -1,35 +1,52 @@
-"""Shared socket configuration for the vision service.
+"""视觉服务共用的 socket 配置。
 
-This project has several independent processes that all talk to the Python
-vision module:
+这个项目里有好几个独立进程都要和 Python 视觉模块通信：
 
-- ``vision/app/vision_socket.py`` owns the Unix Domain Socket server.
-- ``voice/vision_control.py`` sends voice commands to that server.
-- ``ui`` queries the same server for live status and reload notifications.
-- ``rk3588/thread_vision.c`` uses the same path from the C main process.
+- ``vision/app/vision_socket.py`` 负责真正创建 socket 服务端；
+- ``voice/vision_control.py`` 会给这个服务端发送语音控制命令；
+- ``ui`` 会查询同一个服务端，拿实时状态和发送重新加载配置通知；
+- ``rk3588/thread_vision.c`` 里的 C 主控也使用同一路径。
 
-Keep the default path here for Python code, and keep the C/script defaults in
-sync with the value below.  At deployment time, prefer setting the environment
-variable ``VISION_SOCKET_PATH`` instead of editing code; every Python caller in
-this repository reads that variable through ``get_vision_socket_path()``.
+默认路径统一放在这里，避免每个文件各写一个路径。
+部署时优先设置环境变量 ``VISION_SOCKET_PATH``，不要到处改源码。
+本仓库里的 Python 调用方都会通过 ``get_vision_socket_path()`` 读取这个配置。
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 
 VISION_SOCKET_ENV = "VISION_SOCKET_PATH"
-DEFAULT_VISION_SOCKET_PATH = "/tmp/vision_inspection.sock"
+DEFAULT_LINUX_VISION_SOCKET_PATH = "/tmp/vision_inspection.sock"
+
+
+def _default_socket_path() -> str:
+    """返回当前平台更合适的默认 socket 路径。
+
+    在 RK3588 Linux 上，`/tmp/vision_inspection.sock` 很适合放运行时 Unix socket。
+
+    在 Windows 上，`/tmp/...` 会被解释成当前盘符下的路径，例如 `E:\\tmp\\...`。
+    这个目录不一定存在，也不容易发现。
+    所以 Windows 开发阶段改用项目里的 `.tmp` 目录，让仿真器、UI、语音模块
+    不用硬件也能直接跑起来。
+    """
+
+    if os.name == "nt":
+        project_root = Path(__file__).resolve().parents[2]
+        return str(project_root / ".tmp" / "vision_inspection.sock")
+    return DEFAULT_LINUX_VISION_SOCKET_PATH
+
+
+DEFAULT_VISION_SOCKET_PATH = _default_socket_path()
 
 
 def get_vision_socket_path() -> str:
-    """Return the Unix Domain Socket path used by all Python modules.
+    """返回所有 Python 模块共用的视觉 socket 路径。
 
-    The environment variable is intentionally checked at import/runtime instead
-    of hard-coding the deployment path in multiple files.  Empty values are
-    ignored so a mistaken ``VISION_SOCKET_PATH=`` does not make clients try to
-    connect to an invalid blank path.
+    这里故意优先读取环境变量，而不是把部署路径写死在多个文件里。
+    如果环境变量是空字符串，就当作没配置，避免客户端去连接一个空路径。
     """
 
     configured_path = os.environ.get(VISION_SOCKET_ENV, "").strip()
